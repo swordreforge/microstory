@@ -1,0 +1,46 @@
+{
+  "architectures": [
+    "OuroForCausalLM"
+  ],
+  "attention_dropout": 0.0,
+  "auto_map": {
+    "AutoConfig": "configuration_ouro.OuroConfig",
+    "AutoModelForCausalLM": "modeling_ouro.OuroForCausalLM"
+  },
+  "bos_token_id": 1,
+  "early_exit_threshold": null,
+  "embedding_size": 32,
+  "eos_token_id": 2,
+  "ffn_gated": true,
+  "hidden_act": "silu",
+  "hidden_size": 32,
+  "initializer_range": 0.02,
+  "input_embedding_injection_coefficient": 0.0,
+  "intermediate_size": 48,
+  "layer_types": [
+    "full_attention"
+  ],
+  "loop_aux_loss_weight": 0.0,
+  "max_position_embeddings": 2048,
+  "max_window_layers": 28,
+  "model_type": "ouro",
+  "num_attention_heads": 2,
+  "num_hidden_layers": 1,
+  "num_key_value_heads": 1,
+  "pad_token_id": 0,
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": null,
+  "rope_theta": 10000.0,
+  "sliding_window": null,
+  "student_architecture_source": "ByteDance/Ouro-1.4B@574fa66cb8bf5abdc979642d01cf2b79b16bfab1",
+  "student_loss_mode": "last_loop",
+  "tie_word_embeddings": true,
+  "torch_dtype": "float32",
+  "total_ut_steps": 4,
+  "transformers_version": "4.55.0",
+  "use_cache": true,
+  "use_loop_embeddings": false,
+  "use_sliding_window": false,
+  "value_residual_mix": 0.5,
+  "vocab_size": 378
+}

@@ -1,0 +1,20 @@
+{
+  "working_directory": "/tmp",
+  "hf_load": "AutoConfig/AutoTokenizer/AutoModelForCausalLM with trust_remote_code=True",
+  "parameters": 19969,
+  "parameter_groups": {
+    "embedding": 12096,
+    "attention": 3072,
+    "ffn": 4608,
+    "normalization": 160,
+    "unused_exit_gate": 33
+  },
+  "tied_embedding": true,
+  "loops": 4,
+  "physical_layers": 1,
+  "vocab_size": 378,
+  "cache_vs_full_max_abs_difference": 1.9073486328125e-05,
+  "cache_prefix_tokens": 32,
+  "weights_bytes": 81364,
+  "artifact_bytes": 145917
+}

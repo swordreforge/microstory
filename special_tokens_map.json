@@ -1,0 +1,35 @@
+{
+  "additional_special_tokens": [
+    "[PERSON_NAME_1]",
+    "[PERSON_NAME_2]",
+    "[PERSON_NAME_3]"
+  ],
+  "bos_token": {
+    "content": "<|start_story|>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  },
+  "eos_token": {
+    "content": "<|end_story|>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  },
+  "pad_token": {
+    "content": "<|pad|>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  },
+  "unk_token": {
+    "content": "<|unk|>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  }
+}
