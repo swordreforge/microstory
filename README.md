@@ -13,25 +13,22 @@ tags:
 
 # MacroStories
 
+
 ## How small can an autoregressive Transformer be and still write a complete story?
 
-**MacroStories is a ~20k-parameter autoregressive Transformer trained from scratch to write complete English children's stories.** Its FP32 weight file is only **81,364 bytes**.
+MacroStories is a **19,969-parameter autoregressive Transformer** that generates complete English children's stories from a single start token. Its FP32 weights occupy just **81,364 bytes—smaller than many PNG images**.
 
-[TinyStories](https://arxiv.org/abs/2305.07759) showed that the parameter threshold for coherent English depends on the training distribution. Models below 10 million parameters, including models with a single Transformer block, wrote fluent stories when trained on synthetic text restricted to a young child's vocabulary. 
+[TinyStories](https://arxiv.org/abs/2305.07759) showed that small Transformers can write coherent English when trained on a suitable distribution of synthetic stories. MacroStories takes this question down to about **20 thousand parameters**, roughly one fiftieth of a one-million-parameter model.
 
-MacroStories asks the question one step further down: can a Transformer with about 20 thousand parameters, roughly one fiftieth of a one-million-parameter model, write a story of 100–300 words that establishes a goal, takes relevant actions, and reaches an outcome that resolves it? The answer is yes.
+Can a model this small write a story of 100–300 words that establishes a goal, takes relevant actions, and reaches an outcome that resolves it? **The answer is yes.**
 
-The model was built through an agent-led research process. A human supplied the goal and constraints. The main agent, Codex running GPT-6.1-Sol, worked with GPT-6-Luna subagents through **38 numbered experimental rounds on one RTX 3090**, generated training data with a local Gemma model, and chose subsequent experiments from earlier results.
+What did we do? We gave Codex a goal and provided guidance when needed. Codex running GPT-6.1-Sol, assisted by GPT-6-Luna subagents, autonomously carried out the entire training workflow—from generating data with a local Gemma model to training, evaluation, and final model selection. It completed **38 experimental rounds on a single RTX 3090**, choosing each next experiment based on earlier results.
 
 ## Quick start
-
-Install PyTorch for your platform, then the inference dependencies:
 
 ```bash
 pip install "transformers==4.55.0" "safetensors>=0.4.3"
 ```
-
-The original project export was tested with Python 3.13, PyTorch 2.13, and Transformers 4.55.0. Custom architecture code is included in this repository and requires `trust_remote_code=True`.
 
 ```python
 import runpy
@@ -41,17 +38,19 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 repo_id = "raincandy-u/MacroStories"
-tokenizer = AutoTokenizer.from_pretrained(repo_id, trust_remote_code=True)
+
+tokenizer = AutoTokenizer.from_pretrained(repo_id)
 model = AutoModelForCausalLM.from_pretrained(
     repo_id, trust_remote_code=True
 ).eval()
+
 decode_story = runpy.run_path(
     hf_hub_download(repo_id, "render_story.py")
 )["decode_story"]
 
-torch.set_num_threads(4)
 torch.manual_seed(20261007)
 prompt = torch.tensor([[tokenizer.bos_token_id]])
+
 with torch.inference_mode():
     output = model.generate(
         input_ids=prompt,
@@ -59,25 +58,23 @@ with torch.inference_mode():
         do_sample=True,
         temperature=0.5,
         top_p=0.9,
-        min_new_tokens=0,
         max_new_tokens=2047,
         use_cache=True,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     )
+
 raw_story, story, names = decode_story(
     output[0, 1:].tolist(), tokenizer, [tokenizer.eos_token_id]
 )
 print(story)
 ```
 
-The decoder consistently replaces numbered character tokens with `Alex`, `Robin`. `raw_story` preserves the character-token text.
-
-These markers are registered as special tokens, so `skip_special_tokens=True` would remove character references;
+The display helper maps numbered character tokens to `Alex`, `Robin`, and `Casey`. `raw_story` retains the original character markers.
 
 ## Architecture
 
-MacroStories is a decoder-only autoregressive Transformer with **19,969 parameters**. It applies one decoder block four times, sharing the block’s weights across all four passes. The input embedding and output projection also share weights.
+One decoder block is applied **four times with shared weights**. The input embedding and output projection also share a weight matrix, which accounts for **60.6% of all parameters**.
 
 | Component | Configuration |
 |---|---|
@@ -85,11 +82,11 @@ MacroStories is a decoder-only autoregressive Transformer with **19,969 paramete
 | Hidden dimension | 32 |
 | SwiGLU intermediate dimension | 48 |
 | Decoder blocks | 1, applied 4 times |
-| Attention | 2 query heads and 1 shared key/value head; head dimension 16 |
+| Attention | 2 query heads, 1 KV head; head dimension 16 |
 | Position encoding | RoPE |
-| Normalization | RMSNorm before and after each attention and feed-forward sublayer, plus a final output RMSNorm |
-| Value residual | In passes 2–4, average the current value projection with the first pass’s value projection |
-| Input/Output embedding | Shared weight matrix |
+| Normalization | RMSNorm before and after attention and FFN sublayers, plus final output RMSNorm |
+| Value residual | Passes 2–4 mix current value vectors equally with those from pass 1 |
+| Input embedding / output projection | Shared weight matrix |
 
 | Parameter group | Parameters |
 |---|---:|
@@ -97,27 +94,51 @@ MacroStories is a decoder-only autoregressive Transformer with **19,969 paramete
 | Attention projections | 3,072 |
 | SwiGLU projections | 4,608 |
 | RMSNorm | 160 |
-| Inactive early-exit gate retained in the checkpoint | 33 |
+| Inactive early-exit gate | 33 |
 | **Total** | **19,969** |
 
-The implementation is adapted from [ByteDance/Ouro](https://huggingface.co/ByteDance/Ouro-1.4B/tree/574fa66cb8bf5abdc979642d01cf2b79b16bfab1).
+MacroStories was trained from random initialization using an implementation adapted from [ByteDance/Ouro](https://huggingface.co/ByteDance/Ouro-1.4B/tree/574fa66cb8bf5abdc979642d01cf2b79b16bfab1).
 
-MacroStories was trained from random initialization; no pretrained Ouro weights were used.
+## Training
 
-## Training data and procedure
+The training set contains **1,631 unique synthetic stories**, totaling **233,756 tokens including BOS and EOS**. Validation and test sets contain **40 stories each**.
 
-Stories were generated locally with Gemma-4 served through vLLM. Teacher generation was constrained to limited surface word forms and character markers. AI agents read complete stories to filter language errors, unresolved goals, and, in the final expansion stage, identity inconsistencies. Additional training stories with words outside the frozen vocabulary were excluded.
+Stories were generated with a local Gemma model served through vLLM, using vocabulary constraints and numbered character markers. AI agents reviewed complete stories for grammatical correctness, goal resolution, and character and object consistency.
+
+Training used next-token cross-entropy on the fourth recurrent pass. Muon updated the decoder's two-dimensional linear weight matrices; AdamW updated the remaining parameters.
+
+| Setting | Value |
+|---|---|
+| Training updates | 4,000 |
+| Batch size | 32 |
+| Learning rate | 0.003 |
+| Learning-rate schedule | Cosine decay with 5% warmup |
+| Training seed | 456 |
+| Hardware | One RTX 3090 |
+
+## Evaluation
+
+
+| Criterion | Stories meeting the criterion |
+|---|---:|
+| Goal resolved through relevant actions and an outcome | 98 / 100 |
+| No grammatical error on a full reading | 80 / 100 |
+| Consistent characters and objects | 91 / 100 |
+| Length of 100–300 words | 82 / 100 |
+| **All four criteria together** | **65 / 100** |
 
 ## Example output
 
+Sample 20 from the evaluation set contains **106 words** and meets all four criteria:
+
 > "I want to help this flower," Alex said. The flower was dry in the village garden. Alex wanted to water the flower. Alex grabbed a large bucket, but the bucket was too heavy for them to lift. Alex looked at the small cup on the bench. Alex dipped the cup into the bucket. Alex walked to the flower and poured the water onto the soil. Alex went back and forth. Alex made several trips with the small cup. Alex poured more water into the dirt. Alex and Robin watched the plant. Finally, the flower got enough water. Alex smiled because the flower was not dry now.
 
-## Intended use and limitations
+## Capabilities
 
-MacroStories is intended for research, and its tested scope is limited English vocabulary. It has **no world knowledge or instruction-following capability**.
+MacroStories generates English children's stories from a start token within six plot families and a fixed 378-token vocabulary. It has **no world knowledge or instruction-following capability**. It does not support factual question answering, conversation, or writing on arbitrary topics.
 
-It cannot answer factual questions, follow user requests, hold a conversation, or write about arbitrary topics. Even within this scope, outputs can contain grammatical errors, inconsistent character or object references, repeated phrases, and stories shorter than the target length.
+## Acknowledgments
 
-## Reference
+We thank the authors of [TinyStories](https://arxiv.org/abs/2305.07759) for showing how carefully designed synthetic data enables coherent story generation in small language models, and the [ByteDance/Ouro](https://huggingface.co/ByteDance/Ouro-1.4B) team for their work on shared-weight recurrent Transformers and the implementation that served as the foundation for MacroStories.
 
-Ronen Eldan and Yuanzhi Li. *TinyStories: How Small Can Language Models Be and Still Speak Coherent English?* 2023. [arXiv:2305.07759](https://arxiv.org/abs/2305.07759).
+We also thank the Hugging Face team and community for the libraries, tools, and open ecosystem that made this project possible—from training on a single consumer GPU to sharing the finished model with everyone.
