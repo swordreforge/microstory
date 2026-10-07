@@ -71,36 +71,38 @@ raw_story, story, names = decode_story(
 print(story)
 ```
 
-The display helper consistently replaces numbered character tokens with `Alex`, `Robin`, and `Casey`; it does not rewrite sentences or repair errors. `raw_story` preserves the character-token text. These markers are registered as special tokens, so `skip_special_tokens=True` would remove character references; use the helper to retain them. This example generates one story. The reported evaluation used batch size eight, which changes the sampling random-number sequence even with the same seed.
+The decoder consistently replaces numbered character tokens with `Alex`, `Robin`. `raw_story` preserves the character-token text.
+
+These markers are registered as special tokens, so `skip_special_tokens=True` would remove character references;
 
 ## Architecture
 
-A single physical decoder block is applied four times with shared weights. Recurrence increases computation without adding four copies of the parameters.
+MacroStories is a decoder-only autoregressive Transformer with **19,969 parameters**. It applies one decoder block four times, sharing the block’s weights across all four passes. The input embedding and output projection also share weights.
 
-| Setting | Value |
+| Component | Configuration |
 |---|---|
-| Unique parameters | 19,969 |
-| Tokenizer | WordLevel, 378 tokens |
-| Hidden size / FFN intermediate size | 32 / 48 |
-| Physical blocks / recurrent passes | 1 / 4 |
-| Attention | 2 query heads, 1 KV head, head dimension 16 |
-| Activation / position encoding | SwiGLU / RoPE |
-| Normalization | RMSNorm before and after attention/FFN branches |
-| Value residual mixing coefficient | 0.5 |
-| Input/output embeddings | Tied |
-| Maximum sequence length | 2,048 tokens |
-| Weight dtype / file size | FP32 / 81,364 bytes |
+| Vocabulary | 378 WordLevel tokens |
+| Hidden dimension | 32 |
+| SwiGLU intermediate dimension | 48 |
+| Decoder blocks | 1, applied 4 times |
+| Attention | 2 query heads and 1 shared key/value head; head dimension 16 |
+| Position encoding | RoPE |
+| Normalization | RMSNorm before and after each attention and feed-forward sublayer, plus a final output RMSNorm |
+| Value residual | In passes 2–4, average the current value projection with the first pass’s value projection |
+| Input/Output embedding | Shared weight matrix |
 
 | Parameter group | Parameters |
 |---|---:|
-| Shared input/output embedding | 12,096 |
-| Attention | 3,072 |
-| Feed-forward network | 4,608 |
+| Shared embedding / output projection | 12,096 |
+| Attention projections | 3,072 |
+| SwiGLU projections | 4,608 |
 | RMSNorm | 160 |
-| Retained exit gate, with early exit disabled | 33 |
+| Inactive early-exit gate retained in the checkpoint | 33 |
 | **Total** | **19,969** |
 
-Architecture code is adapted from [ByteDance/Ouro-1.4B at revision `574fa66cb8bf5abdc979642d01cf2b79b16bfab1`](https://huggingface.co/ByteDance/Ouro-1.4B/tree/574fa66cb8bf5abdc979642d01cf2b79b16bfab1). **MacroStories was initialized randomly and did not load Ouro's pretrained weights.** 
+The implementation is adapted from [ByteDance/Ouro](https://huggingface.co/ByteDance/Ouro-1.4B/tree/574fa66cb8bf5abdc979642d01cf2b79b16bfab1).
+
+MacroStories was trained from random initialization; no pretrained Ouro weights were used.
 
 ## Training data and procedure
 
