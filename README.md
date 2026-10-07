@@ -16,13 +16,11 @@ tags:
 
 ## How small can an autoregressive Transformer be and still write a complete story?
 
-MacroStories is a **19,969-parameter autoregressive Transformer** that generates complete English children's stories from a single start token. Its FP32 weights occupy just **81,364 bytes—smaller than many PNG images**.
+MacroStories is a **19,969-parameter autoregressive Transformer** that generates complete English children's stories from a single start token. Her FP32 weights occupy just **81,364 bytes—smaller than many PNG images**.
 
-[TinyStories](https://arxiv.org/abs/2305.07759) showed that small Transformers can write coherent English when trained on a suitable distribution of synthetic stories. MacroStories takes this question down to about **20 thousand parameters**, roughly one fiftieth of a one-million-parameter model.
+[TinyStories](https://arxiv.org/abs/2305.07759) showed that small Transformers can write coherent English when trained on a suitable distribution of synthetic stories. 
 
-Can a model this small write a story of 100–300 words that establishes a goal, takes relevant actions, and reaches an outcome that resolves it? **The answer is yes.**
-
-What did we do? We gave Codex a goal and provided guidance when needed. Codex running GPT-6.1-Sol, assisted by GPT-6-Luna subagents, autonomously carried out the entire training workflow—from generating data with a local Gemma model to training, evaluation, and final model selection. It completed **38 experimental rounds on a single RTX 3090**, choosing each next experiment based on earlier results.
+We takes this question down to about **20 thousand parameters**, roughly one fiftieth of a one-million-parameter model and proved that a model even this small can write a story of 100–300 words that establishes a goal, takes relevant actions, and reaches an outcome that resolves it.
 
 ## Quick start
 
@@ -101,9 +99,9 @@ MacroStories was trained from random initialization using an implementation adap
 
 ## Training
 
-The training set contains **1,631 unique synthetic stories**, totaling **233,756 tokens including BOS and EOS**. Validation and test sets contain **40 stories each**.
+We gave Codex a goal and guidance when needed. She autonomously carried out the entire workflow, generating data, forming hypotheses, testing them, refining them from the results, and testing again—through **38 experimental rounds** to final model selection.
 
-Stories were generated with a local Gemma model served through vLLM, using vocabulary constraints and numbered character markers. AI agents reviewed complete stories for grammatical correctness, goal resolution, and character and object consistency.
+Stories were generated with a local Gemma model served through vLLM, using vocabulary constraints and numbered character markers. Codex reviewed complete stories for grammatical correctness, goal resolution, and character and object consistency.
 
 Training used next-token cross-entropy on the fourth recurrent pass. Muon updated the decoder's two-dimensional linear weight matrices; AdamW updated the remaining parameters.
 
@@ -118,7 +116,6 @@ Training used next-token cross-entropy on the fourth recurrent pass. Muon update
 
 ## Evaluation
 
-
 | Criterion | Stories meeting the criterion |
 |---|---:|
 | Goal resolved through relevant actions and an outcome | 98 / 100 |
@@ -129,13 +126,11 @@ Training used next-token cross-entropy on the fourth recurrent pass. Muon update
 
 ## Example output
 
-Sample 20 from the evaluation set contains **106 words** and meets all four criteria:
-
 > "I want to help this flower," Alex said. The flower was dry in the village garden. Alex wanted to water the flower. Alex grabbed a large bucket, but the bucket was too heavy for them to lift. Alex looked at the small cup on the bench. Alex dipped the cup into the bucket. Alex walked to the flower and poured the water onto the soil. Alex went back and forth. Alex made several trips with the small cup. Alex poured more water into the dirt. Alex and Robin watched the plant. Finally, the flower got enough water. Alex smiled because the flower was not dry now.
 
 ## Capabilities
 
-MacroStories generates English children's stories from a start token within six plot families and a fixed 378-token vocabulary. It has **no world knowledge or instruction-following capability**. It does not support factual question answering, conversation, or writing on arbitrary topics.
+The model is designed only to generate English children's stories. She has **no world knowledge or instruction-following capability**. She does not support factual question answering, conversation, or writing on arbitrary topics.
 
 ## Acknowledgments
 
