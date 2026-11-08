@@ -5,8 +5,9 @@
 // O(pos) per step). Pass --no-kv to fall back to full-sequence recompute.
 // `--selftest-kv` compares cached vs full logits on a 257-token sequence.
 //
-// SIMD: explicit AVX2/FMA kernels with a no-tree-vectorize scalar reference.
-// `--no-simd` forces scalar; `--selftest-simd` verifies both paths agree.
+// SIMD: scalar reference + AVX2 + AVX-512/FMA kernels, selectable with
+// `--simd avx512|avx2|scalar` (or `--no-simd`). `--selftest-simd` checks
+// each compiled level against the scalar reference.
 // Batch: `--threads N` runs N independent sequences concurrently;
 // `--batch-gemm B` decodes B sequences in one lockstep forward (weight-row
 // reuse), combinable as `--threads T --batch-gemm B`. `--selftest-batch`
@@ -105,8 +106,23 @@ static Weights load_weights(const std::string& path) {
     return w;
 }
 
-// ---- kernels: scalar reference + AVX2/FMA, runtime selectable --------------
-static bool g_use_simd = true;
+// ---- kernels: scalar reference + AVX2/AVX-512 FMA, runtime selectable ------
+// g_simd: 0 = scalar, 2 = AVX2, 5 = AVX-512, 6 = hybrid (AVX2 for n<=16,
+// AVX-512 otherwise). Defaults to AVX2 even when AVX-512 is compiled:
+// on the tested Xeon Platinum, sustained AVX-512 downclocks the core and
+// measured ~17% slower than AVX2 for this model. Opt in with
+// `--simd avx512` or `--simd hybrid` on hardware where it actually wins.
+#if defined(__AVX2__)
+static int g_simd = 2;
+#else
+static int g_simd = 0;
+#endif
+
+static const char* simd_name(int s) {
+    if (s >= 6) return "hybrid";
+    if (s >= 5) return "avx512";
+    return s >= 2 ? "avx2" : "scalar";
+}
 
 #pragma GCC push_options
 #pragma GCC optimize("no-tree-vectorize")
@@ -180,27 +196,95 @@ static void rmsnorm_avx2(const Tensor& w, const float* x, float* y) {
 }
 #endif
 
+#if defined(__AVX512F__)
+static inline float hsum512(__m512 v) {
+#if defined(__AVX512DQ__)
+    __m256 lo = _mm512_castps512_ps256(v);
+    __m256 hi = _mm512_extractf32x8_ps(v, 1);
+    return hsum256(_mm256_add_ps(lo, hi));
+#else
+    alignas(64) float t[16];
+    _mm512_storeu_ps(t, v);
+    float s = 0.0f;
+    for (int i = 0; i < 16; ++i) s += t[i];
+    return s;
+#endif
+}
+static float dot_avx512(const float* a, const float* b, int n) {
+    __m512 acc = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16)
+        acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+    float s = hsum512(acc);
+    for (; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+static void axpy_avx512(float* y, const float* x, float a, int n) {
+    __m512 va = _mm512_set1_ps(a);
+    int i = 0;
+    for (; i + 16 <= n; i += 16)
+        _mm512_storeu_ps(y + i, _mm512_fmadd_ps(va, _mm512_loadu_ps(x + i), _mm512_loadu_ps(y + i)));
+    for (; i < n; ++i) y[i] += a * x[i];
+}
+static void matvec_avx512(const Tensor& t, int out_dim, int in_dim, const float* x, float* y) {
+    for (int i = 0; i < out_dim; ++i)
+        y[i] = dot_avx512(t.data + static_cast<size_t>(i) * in_dim, x, in_dim);
+}
+static void rmsnorm_avx512(const Tensor& w, const float* x, float* y) {
+    float ss = dot_avx512(x, x, HID);
+    __m512 vinv = _mm512_set1_ps(1.0f / std::sqrt(ss / HID + EPS));
+    for (int i = 0; i + 16 <= HID; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        __m512 wt = _mm512_loadu_ps(w.data + i);
+        _mm512_storeu_ps(y + i, _mm512_mul_ps(_mm512_mul_ps(v, wt), vinv));
+    }
+}
+#endif
+
 static inline float dotv(const float* a, const float* b, int n) {
+#if defined(__AVX512F__)
+    if (g_simd >= 5) {
 #if defined(__AVX2__)
-    if (g_use_simd) return dot_avx2(a, b, n);
+        if (g_simd >= 6 && n <= 16) return dot_avx2(a, b, n);
+#endif
+        return dot_avx512(a, b, n);
+    }
+#endif
+#if defined(__AVX2__)
+    if (g_simd >= 2) return dot_avx2(a, b, n);
 #endif
     return dot_scalar(a, b, n);
 }
 static inline void axpyv(float* y, const float* x, float a, int n) {
+#if defined(__AVX512F__)
+    if (g_simd >= 5) {
 #if defined(__AVX2__)
-    if (g_use_simd) { axpy_avx2(y, x, a, n); return; }
+        if (g_simd >= 6 && n <= 16) { axpy_avx2(y, x, a, n); return; }
+#endif
+        axpy_avx512(y, x, a, n);
+        return;
+    }
+#endif
+#if defined(__AVX2__)
+    if (g_simd >= 2) { axpy_avx2(y, x, a, n); return; }
 #endif
     axpy_scalar(y, x, a, n);
 }
 static inline void matvec(const Tensor& t, int out_dim, int in_dim, const float* x, float* y) {
+#if defined(__AVX512F__)
+    if (g_simd >= 5) { matvec_avx512(t, out_dim, in_dim, x, y); return; }
+#endif
 #if defined(__AVX2__)
-    if (g_use_simd) { matvec_avx2(t, out_dim, in_dim, x, y); return; }
+    if (g_simd >= 2) { matvec_avx2(t, out_dim, in_dim, x, y); return; }
 #endif
     matvec_scalar(t, out_dim, in_dim, x, y);
 }
 static inline void rmsnorm(const Tensor& w, const float* x, float* y) {
+#if defined(__AVX512F__)
+    if (g_simd >= 5) { rmsnorm_avx512(w, x, y); return; }
+#endif
 #if defined(__AVX2__)
-    if (g_use_simd) { rmsnorm_avx2(w, x, y); return; }
+    if (g_simd >= 2) { rmsnorm_avx2(w, x, y); return; }
 #endif
     rmsnorm_scalar(w, x, y);
 }
@@ -350,7 +434,8 @@ static void rope_apply(float* vec, const float* cosv, const float* sinv) {
 static void forward_token(const Weights& w, int token, int pos, KVCache& cache, float* logits) {
     float x[HID], r[HID], cur[HID], qv[NH * HD], kv[NKV * HD], vv[NKV * HD], first_v[NKV * HD];
     float attn[NH * HD], out[HID], tmp[HID], z[HID], g[INTER], u[INTER], m[INTER];
-    std::vector<float> scores(static_cast<size_t>(pos) + 1);
+    static thread_local std::vector<float> scores;
+    scores.resize(static_cast<size_t>(pos) + 1);
 
     for (int i = 0; i < HID; ++i) x[i] = w.embed.data[static_cast<size_t>(token) * HID + i];
 
@@ -439,14 +524,22 @@ static void matmul_batch(const Tensor& W, int M, int N, int K, const float* x, f
 
 static void forward_batch_token(const Weights& w, const int* tokens, int M, int pos,
                                 KVCache** caches, float* logits) {
-    std::vector<float> x(static_cast<size_t>(M) * HID), cur(static_cast<size_t>(M) * HID);
-    std::vector<float> r(static_cast<size_t>(M) * HID), z(static_cast<size_t>(M) * HID);
-    std::vector<float> q(static_cast<size_t>(M) * NH * HD), k(static_cast<size_t>(M) * NKV * HD);
-    std::vector<float> v(static_cast<size_t>(M) * NKV * HD), first_v(static_cast<size_t>(M) * NKV * HD);
-    std::vector<float> attn(static_cast<size_t>(M) * NH * HD), out(static_cast<size_t>(M) * HID);
-    std::vector<float> tmp(static_cast<size_t>(M) * HID);
-    std::vector<float> g(static_cast<size_t>(M) * INTER), u(static_cast<size_t>(M) * INTER), m(static_cast<size_t>(M) * INTER);
-    std::vector<float> scores(static_cast<size_t>(pos) + 1);
+    static thread_local std::vector<float> x, cur, r, z, q, k, v, first_v, attn, out, tmp, g, u, m, scores;
+    x.resize(static_cast<size_t>(M) * HID);
+    cur.resize(static_cast<size_t>(M) * HID);
+    r.resize(static_cast<size_t>(M) * HID);
+    z.resize(static_cast<size_t>(M) * HID);
+    q.resize(static_cast<size_t>(M) * NH * HD);
+    k.resize(static_cast<size_t>(M) * NKV * HD);
+    v.resize(static_cast<size_t>(M) * NKV * HD);
+    first_v.resize(static_cast<size_t>(M) * NKV * HD);
+    attn.resize(static_cast<size_t>(M) * NH * HD);
+    out.resize(static_cast<size_t>(M) * HID);
+    tmp.resize(static_cast<size_t>(M) * HID);
+    g.resize(static_cast<size_t>(M) * INTER);
+    u.resize(static_cast<size_t>(M) * INTER);
+    m.resize(static_cast<size_t>(M) * INTER);
+    scores.resize(static_cast<size_t>(pos) + 1);
 
     for (int b = 0; b < M; ++b)
         for (int i = 0; i < HID; ++i)
@@ -658,16 +751,16 @@ static std::string detokenize(const std::vector<int>& ids, const Tokenizer& tk) 
 
 // ---- sampling -------------------------------------------------------------
 static int sample(const float* logits, float temp, float top_p, std::mt19937& rng) {
-    std::vector<float> p(VOCAB);
+    float p[VOCAB];
+    int order[VOCAB];
     float mx = -1e30f;
     for (int i = 0; i < VOCAB; ++i) { p[i] = logits[i] / temp; if (p[i] > mx) mx = p[i]; }
     float sum = 0.0f;
     for (int i = 0; i < VOCAB; ++i) { p[i] = std::exp(p[i] - mx); sum += p[i]; }
     for (int i = 0; i < VOCAB; ++i) p[i] /= sum;
 
-    std::vector<int> order(VOCAB);
     for (int i = 0; i < VOCAB; ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](int a, int b) { return p[a] > p[b]; });
+    std::sort(order, order + VOCAB, [&](int a, int b) { return p[a] > p[b]; });
     float cum = 0.0f;
     int keep = 0;
     for (int i = 0; i < VOCAB; ++i) { cum += p[order[i]]; ++keep; if (cum >= top_p) break; }
@@ -725,7 +818,14 @@ int main(int argc, char** argv) {
         else if (a == "--batch" && i + 1 < argc) nthreads = std::max(1, std::atoi(argv[++i]));
         else if (a == "--batch-gemm" && i + 1 < argc) batch_gemm = std::max(1, std::atoi(argv[++i]));
         else if (a == "--no-kv") use_kv = false;
-        else if (a == "--no-simd") g_use_simd = false;
+        else if (a == "--no-simd") g_simd = 0;
+        else if (a == "--simd" && i + 1 < argc) {
+            std::string s = argv[++i];
+            if (s == "scalar" || s == "0") g_simd = 0;
+            else if (s == "avx2" || s == "2") g_simd = 2;
+            else if (s == "avx512" || s == "512" || s == "5") g_simd = 5;
+            else if (s == "hybrid" || s == "6") g_simd = 6;
+        }
         else if (a == "--selftest-kv") selftest_kv = true;
         else if (a == "--selftest-simd") selftest_simd = true;
         else if (a == "--selftest-batch") selftest_batch = true;
@@ -763,6 +863,18 @@ int main(int argc, char** argv) {
     }
 
     if (selftest_simd) {
+        std::vector<int> levels = {0};
+#if defined(__AVX2__)
+        levels.push_back(2);
+#endif
+#if defined(__AVX512F__)
+        levels.push_back(5);
+        levels.push_back(6);
+#endif
+        std::printf("compiled levels:");
+        for (int l : levels) std::printf(" %s", simd_name(l));
+        std::printf("\n");
+
         std::mt19937 r(123);
         std::uniform_int_distribution<int> d(0, VOCAB - 1);
         float worst = 0.0f;
@@ -770,26 +882,29 @@ int main(int argc, char** argv) {
         for (int L : {1, 7, 33, 128, 257}) {
             std::vector<int> seq(L);
             for (auto& x : seq) x = d(r);
-            std::vector<float> a(VOCAB), b(VOCAB);
-            g_use_simd = true;
-            KVCache c1(L + 2);
-            for (int pos = 0; pos < L; ++pos) forward_token(w, seq[pos], pos, c1, a.data());
-            g_use_simd = false;
-            KVCache c2(L + 2);
-            for (int pos = 0; pos < L; ++pos) forward_token(w, seq[pos], pos, c2, b.data());
-            g_use_simd = true;
-            float md = 0.0f;
-            for (int i = 0; i < VOCAB; ++i) md = std::max(md, std::fabs(a[i] - b[i]));
-            std::printf("simd-vs-scalar L=%4d max_abs_diff=%.3e\n", L, md);
-            if (md > worst) { worst = md; worstL = L; }
+            std::vector<std::vector<float>> outs(levels.size(), std::vector<float>(VOCAB));
+            for (size_t k = 0; k < levels.size(); ++k) {
+                g_simd = levels[k];
+                KVCache c(L + 2);
+                for (int pos = 0; pos < L; ++pos) forward_token(w, seq[pos], pos, c, outs[k].data());
+            }
+            for (size_t k = 1; k < levels.size(); ++k) {
+                float md = 0.0f;
+                for (int i = 0; i < VOCAB; ++i) md = std::max(md, std::fabs(outs[k][i] - outs[0][i]));
+                std::printf("L=%4d %-7s-vs-scalar max_abs_diff=%.3e\n", L, simd_name(levels[k]), md);
+                if (md > worst) { worst = md; worstL = L; }
+            }
         }
-        g_use_simd = true;
-        auto a = generate_ids(w, 42, 128, temp, top_p, true);
-        g_use_simd = false;
-        auto b = generate_ids(w, 42, 128, temp, top_p, true);
-        g_use_simd = true;
-        std::printf("worst L=%d diff=%.3e; generation identical=%s\n",
-                    worstL, worst, a == b ? "YES" : "NO");
+        g_simd = 0;
+        std::vector<int> ref = generate_ids(w, 42, 128, temp, top_p, true);
+        bool same = true;
+        for (size_t k = 1; k < levels.size(); ++k) {
+            g_simd = levels[k];
+            if (generate_ids(w, 42, 128, temp, top_p, true) != ref) same = false;
+        }
+        g_simd = levels.back();
+        std::printf("worst L=%d diff=%.3e; generation identical across levels=%s\n",
+                    worstL, worst, same ? "YES" : "NO");
         return 0;
     }
 
@@ -864,6 +979,6 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "[mode %s, seq %zu, tokens %zu, %.1f ms, %.0f tok/s, kv=%s, simd=%s]\n",
                  mode, results.size(), total, secs * 1000.0, total / secs,
-                 use_kv ? "on" : "off", g_use_simd ? "on" : "off");
+                 use_kv ? "on" : "off", simd_name(g_simd));
     return 0;
 }
