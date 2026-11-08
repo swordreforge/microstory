@@ -9,7 +9,7 @@
 - 模型只有 **19,969 个参数 / 81,364 字节（FP32）**，1 层权重循环 4 次。
 - 本机默认只有 Python 3.14（无 torch）；用 `uv` 建了 Python 3.12 venv，装 `torch==2.8.0+xpu` + `transformers==4.55.0` 跑通。
 - 四个后端全部验证通过：**PyTorch（CPU/XPU）、ONNX Runtime、ncnn、手写 C++**。
-- **手写 C++ 是当前最优解**：单线程 ~60k tok/s（top-p 选择优化后），多线程 ~28.5 万 tok/s，峰值内存仅 **~7.6MB**。
+- **手写 C++ 是当前最优解**：单线程 ~9µs/token（约 **110k tok/s**，top-p 选择 + 向量化 exp），多线程 ~28.5 万 tok/s，峰值内存仅 **~7.6MB**。
 - **Vulkan 不划算**：本机驱动齐全（Mesa ANV，Vulkan 1.4），但 ncnn Vulkan 比 CPU 慢约 **18×**，小模型被 kernel 启动开销拖死。
 - **int8 / AVX-VNNI 可跳过**：模型太小，量化误差（logits 差 0.93）远大于收益。
 - **AVX-512 已实测但默认不用**：远程 Xeon 上比 AVX2 慢约 **17%**（持续 512-bit FMA 触发降频），故默认 AVX2，仅保留 `--simd avx512|hybrid` 选项。
@@ -102,7 +102,7 @@ make -C cpp
 | torch XPU（Arc） | 151 tok | 6.76 s | ~22 tok/s |
 | torch CPU | 141 tok | 1.25 s | ~113 tok/s |
 | ONNX Runtime CPU（无 KV cache） | 131 tok | 0.38 s | ~342 tok/s |
-| **C++ 单线程（KV+SIMD+top-p 选择）** | 131 tok | ~2 ms（纯解码） | **~60k tok/s** |
+| **C++ 单线程（KV+SIMD+top-p 选择+快速 exp）** | 131 tok | ~1.2 ms（纯解码） | **~110k tok/s** |
 | **C++ 22 线程** | 3026 tok | ~10.6 ms | **~28.5 万 tok/s** |
 | **C++ 22 线程 × batch 4** | 12078 tok | ~37 ms | **~32.5 万 tok/s** |
 
@@ -243,6 +243,22 @@ make -C cpp
 - 性能（CPU 时间）：top_p=0.9 从 **~36–39µs** 降到 **~13–17µs/token（约 2.3×）**；top_p=1.0 与旧版持平（±噪声）。
 - keep 分布：top_p=0.9 中位数 1；0.99 中位数 2、p90=5；1.0 均值 ~162（因此必须回退）。
 
+### 6.8 向量化/近似 exp（已合入）
+
+- 背景：softmax（attention）、SiLU、采样都需要 `exp`。每 token 约 1,000 次 attention exp + 192 次 SiLU exp + 378 次采样 exp，标量 `expf` 成为热点。
+- 实现：AVX2 多项式 exp（范围规约 `x = n·ln2 + r`，6 阶多项式，`2^n` 用位运算），相对误差 ~1e-7；`--exp-scalar` 可切回精确 `std::exp`。
+- 微基准（ns/array）：
+
+| n | scalar | libmvec | poly | poly 加速 |
+|---:|---:|---:|---:|---:|
+| 32 | 108 | 188 | 28 | 3.85× |
+| 128 | 278 | 731 | 53 | 5.30× |
+| 378 | 687 | 1887 | 118 | 5.85× |
+
+  （glibc libmvec 的 `_ZGVdN8v_expf` 在这些小数组上反而比标量慢，未采用。）
+- 正确性：logits 相对参考差异约 4e-6；4 个 seed 下 fast vs scalar 生成**逐字一致**；`--selftest-kv/simd/batch` 全通过。
+- 性能（CPU 时间）：forward-only **12.49 → 7.42µs/token（-40.6%）**；同进程连续生成 **11.41 → 9.05µs/token（-20.7%，约 110k tok/s）**。
+
 ---
 
 ## 7. 结论与建议
@@ -325,6 +341,7 @@ make -C cpp
 > 输入/权重校验、死代码清理与 RoPE 频率预计算随最新一次提交入库。
 > Zig 0.17 单文件移植与 API 变动说明见 `zig/README.md`，随本次提交入库。
 > top-p 选择优化（`sample_select` + 回退）随最新一次提交入库。
+> 向量化/近似 exp（AVX2 多项式，默认开启，`--exp-scalar` 回退）随最新一次提交入库。
 
 ## 10. 外部代码评审的处理
 
@@ -359,7 +376,7 @@ make -C cpp
   - SIMD 用 `@Vector(8, f32)` + `@mulAdd` + `@reduce(.Add, ...)`。
 - 显式分配：`ArenaAllocator` 一次性承载权重、tokenizer、KV cache 与输出缓冲，末尾统一 `deinit`；每 token 临时量走栈，热路径无堆分配。
 - 验证：`--logits` 与 Python 参考 max abs diff **6.5e-6**；单线程解码（CPU 时间）约 **67µs/token ≈ 15k tok/s**，C++ AVX2 约 **36µs/token ≈ 28k tok/s**（`-fstrip` 后约 358KB）。
-- 注：上述 C++ 对比在 top-p 选择优化合入前测得；合入后 C++ 单线程完整生成约 **13–17µs/token（~60k tok/s）**，Zig 仍用 `std.sort.pdq` 全排序。
+- 注：上述 C++ 对比在 top-p 选择与向量化 exp 合入前测得；合入后 C++ 单线程完整生成约 **9µs/token（~110k tok/s）**，Zig 仍用 `std.sort.pdq` 全排序。
 - 差距根因（实测拆分）：**前向** Zig 22.4µs vs C++ 11.5µs（C++ 手写 AVX2 覆盖 matvec/rmsnorm/axpy，Zig 仅 `dot` 用 `@Vector`）；**采样** Zig `pdq` 20.8µs vs C++ `std::sort` 7.4µs（误用 `std.sort.heap` 时 31.7µs，换 `pdq` 后完整生成约快 15%）；**加载不是瓶颈**（Zig 1.5–1.7ms，C++ 2.2–2.4ms）。
 - 编译器归因（GCC 16 vs Zig 0.17 的 LLVM 22）：**等价内核结构下 GCC/Clang 基本打平**（dot-only 15.51 vs 15.57µs），编译器不是主因；GCC 仅在手写 AVX2 全内核上有内联/展开优势（11.24 vs 14.89µs）。Zig 与等价 C++ 仍有 ~18–30% 语言/运行时差距，strict FP 再损失 ~10%（`@setFloatMode(.optimized)` 20.39→18.25µs，精度 6.95e-6）。
 - 详见 `zig/README.md`。

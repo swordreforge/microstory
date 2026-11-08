@@ -53,7 +53,7 @@ var cache = KVCache{
 - 单线程解码（CPU 时间，排除加载）：Zig **~67µs/token ≈ 15k tok/s**，C++ AVX2 **~36µs/token ≈ 28k tok/s**；`-fstrip` 后二进制约 **358KB**。
 - 差距拆分（实测）：
   - **前向**：Zig 22.4µs vs C++ 11.5µs（约 2×）。C++ 对 matvec/rmsnorm/axpy 都手写 AVX2 并展开；Zig 只有 `dot` 用 `@Vector`。
-  - **采样**：C++ `std::sort` 7.4µs vs Zig `pdq` 20.8µs（旧版误用 `std.sort.heap` 为 31.7µs）。换 `pdq` 后完整生成约快 **15%**。（该微基准为固定 logits，可能被编译器 hoist；C++ 现已在解码循环改用 top-p 选择，完整生成约 13–17µs/token；Zig 仍是全排序。）
+  - **采样**：C++ `std::sort` 7.4µs vs Zig `pdq` 20.8µs（旧版误用 `std.sort.heap` 为 31.7µs）。换 `pdq` 后完整生成约快 **15%**。（该微基准为固定 logits，可能被编译器 hoist；C++ 现已在解码循环改用 top-p 选择 + 向量化 exp，完整生成约 9µs/token（~110k tok/s）；Zig 仍是全排序。）
   - **加载不是瓶颈**：Zig 1.5–1.7ms，C++ 2.2–2.4ms（Zig 反而更快）。
 
 ## 编译器 / LLVM 归因（GCC 16 vs Zig 0.17 的 LLVM 22）
