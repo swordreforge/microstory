@@ -13,6 +13,7 @@
 // reuse), combinable as `--threads T --batch-gemm B`. `--selftest-batch`
 // compares batched output against per-sequence output.
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -63,10 +64,17 @@ struct Weights {
 static std::vector<float> g_storage;
 
 static Tensor find_tensor(const std::vector<char>& file, const std::string& header,
-                          const std::string& name) {
+                          const std::string& name, int expected_numel) {
     std::string key = "\"" + name + "\"";
     size_t p = header.find(key);
     if (p == std::string::npos) { std::fprintf(stderr, "missing tensor %s\n", name.c_str()); std::exit(1); }
+    size_t obj_b = header.find('{', p);
+    size_t obj_e = header.find('}', obj_b);
+    if (obj_b == std::string::npos || obj_e == std::string::npos ||
+        header.substr(obj_b, obj_e - obj_b).find("\"F32\"") == std::string::npos) {
+        std::fprintf(stderr, "tensor %s is not float32\n", name.c_str());
+        std::exit(1);
+    }
     size_t d = header.find("\"data_offsets\"", p);
     size_t lb = header.find('[', d);
     size_t c1 = header.find(',', lb);
@@ -74,6 +82,11 @@ static Tensor find_tensor(const std::vector<char>& file, const std::string& head
     long start = std::stol(header.substr(lb + 1, c1 - lb - 1));
     long end = std::stol(header.substr(c1 + 1, c2 - c1 - 1));
     int numel = static_cast<int>((end - start) / 4);
+    if (numel != expected_numel) {
+        std::fprintf(stderr, "tensor %s has %d elements, expected %d\n",
+                     name.c_str(), numel, expected_numel);
+        std::exit(1);
+    }
     size_t data_base = 8 + header.size();
     const float* src = reinterpret_cast<const float*>(file.data() + data_base + start);
     size_t off = g_storage.size();
@@ -89,20 +102,20 @@ static Weights load_weights(const std::string& path) {
     std::string header(file.data() + 8, hlen);
     g_storage.reserve(file.size() / sizeof(float) + 64);
     Weights w;
-    w.embed = find_tensor(file, header, "model.embed_tokens.weight");
+    w.embed = find_tensor(file, header, "model.embed_tokens.weight", VOCAB * HID);
     const std::string p = "model.layers.0.";
-    w.q = find_tensor(file, header, p + "self_attn.q_proj.weight");
-    w.k = find_tensor(file, header, p + "self_attn.k_proj.weight");
-    w.v = find_tensor(file, header, p + "self_attn.v_proj.weight");
-    w.o = find_tensor(file, header, p + "self_attn.o_proj.weight");
-    w.gate = find_tensor(file, header, p + "mlp.gate_proj.weight");
-    w.up = find_tensor(file, header, p + "mlp.up_proj.weight");
-    w.down = find_tensor(file, header, p + "mlp.down_proj.weight");
-    w.ln1 = find_tensor(file, header, p + "input_layernorm.weight");
-    w.ln1b = find_tensor(file, header, p + "input_layernorm_2.weight");
-    w.ln2 = find_tensor(file, header, p + "post_attention_layernorm.weight");
-    w.ln2b = find_tensor(file, header, p + "post_attention_layernorm_2.weight");
-    w.norm = find_tensor(file, header, "model.norm.weight");
+    w.q = find_tensor(file, header, p + "self_attn.q_proj.weight", NH * HD * HID);
+    w.k = find_tensor(file, header, p + "self_attn.k_proj.weight", NKV * HD * HID);
+    w.v = find_tensor(file, header, p + "self_attn.v_proj.weight", NKV * HD * HID);
+    w.o = find_tensor(file, header, p + "self_attn.o_proj.weight", HID * NH * HD);
+    w.gate = find_tensor(file, header, p + "mlp.gate_proj.weight", INTER * HID);
+    w.up = find_tensor(file, header, p + "mlp.up_proj.weight", INTER * HID);
+    w.down = find_tensor(file, header, p + "mlp.down_proj.weight", HID * INTER);
+    w.ln1 = find_tensor(file, header, p + "input_layernorm.weight", HID);
+    w.ln1b = find_tensor(file, header, p + "input_layernorm_2.weight", HID);
+    w.ln2 = find_tensor(file, header, p + "post_attention_layernorm.weight", HID);
+    w.ln2b = find_tensor(file, header, p + "post_attention_layernorm_2.weight", HID);
+    w.norm = find_tensor(file, header, "model.norm.weight", HID);
     return w;
 }
 
@@ -292,6 +305,15 @@ static void silu_mul(const float* g, const float* u, float* out) {
     silu_mul_scalar(g, u, out);
 }
 
+static const float* rope_inv_freq() {
+    static const std::array<float, HD / 2> inv = [] {
+        std::array<float, HD / 2> a{};
+        for (int j = 0; j < HD / 2; ++j) a[j] = std::pow(THETA, -(2.0f * j) / HD);
+        return a;
+    }();
+    return inv.data();
+}
+
 // Forward over a token sequence; writes logits of the last position into logits[VOCAB].
 static void forward(const Weights& w, const int* ids, int S, float* logits) {
     std::vector<float> x(static_cast<size_t>(S) * HID);
@@ -300,15 +322,16 @@ static void forward(const Weights& w, const int* ids, int S, float* logits) {
     std::vector<float> v(static_cast<size_t>(S) * NKV * HD), first_v(static_cast<size_t>(S) * NKV * HD);
     std::vector<float> attn(static_cast<size_t>(S) * NH * HD);
     std::vector<float> tmp(static_cast<size_t>(S) * HID), z(static_cast<size_t>(S) * HID);
-    std::vector<float> h(static_cast<size_t>(S) * INTER), cur(HID), out(HID);
+    std::vector<float> cur(HID), out(HID);
 
     // input embeddings
     for (int s = 0; s < S; ++s)
         for (int i = 0; i < HID; ++i) x[static_cast<size_t>(s) * HID + i] = w.embed.data[static_cast<size_t>(ids[s]) * HID + i];
 
     // RoPE cos/sin tables
+    const float* invf = rope_inv_freq();
     for (int j = 0; j < HD / 2; ++j) {
-        float invfreq = std::pow(THETA, -(2.0f * j) / HD);
+        float invfreq = invf[j];
         for (int s = 0; s < S; ++s) {
             float a = s * invfreq;
             float c = std::cos(a), sn = std::sin(a);
@@ -440,8 +463,9 @@ static void forward_token(const Weights& w, int token, int pos, KVCache& cache, 
     for (int i = 0; i < HID; ++i) x[i] = w.embed.data[static_cast<size_t>(token) * HID + i];
 
     float cosv[HD], sinv[HD];
+    const float* invf = rope_inv_freq();
     for (int j = 0; j < HD / 2; ++j) {
-        float invfreq = std::pow(THETA, -(2.0f * j) / HD);
+        float invfreq = invf[j];
         float a = pos * invfreq;
         cosv[j] = cosv[j + HD / 2] = std::cos(a);
         sinv[j] = sinv[j + HD / 2] = std::sin(a);
@@ -546,8 +570,9 @@ static void forward_batch_token(const Weights& w, const int* tokens, int M, int 
             x[static_cast<size_t>(b) * HID + i] = w.embed.data[static_cast<size_t>(tokens[b]) * HID + i];
 
     float cosv[HD], sinv[HD];
+    const float* invf = rope_inv_freq();
     for (int j = 0; j < HD / 2; ++j) {
-        float invfreq = std::pow(THETA, -(2.0f * j) / HD);
+        float invfreq = invf[j];
         float a = pos * invfreq;
         cosv[j] = cosv[j + HD / 2] = std::cos(a);
         sinv[j] = sinv[j + HD / 2] = std::sin(a);
@@ -815,7 +840,6 @@ int main(int argc, char** argv) {
         else if (a == "--temp" && i + 1 < argc) temp = std::atof(argv[++i]);
         else if (a == "--top-p" && i + 1 < argc) top_p = std::atof(argv[++i]);
         else if (a == "--threads" && i + 1 < argc) nthreads = std::max(1, std::atoi(argv[++i]));
-        else if (a == "--batch" && i + 1 < argc) nthreads = std::max(1, std::atoi(argv[++i]));
         else if (a == "--batch-gemm" && i + 1 < argc) batch_gemm = std::max(1, std::atoi(argv[++i]));
         else if (a == "--no-kv") use_kv = false;
         else if (a == "--no-simd") g_simd = 0;
@@ -840,6 +864,24 @@ int main(int argc, char** argv) {
                 st = c + 1;
             }
         }
+    }
+
+    if (temp <= 0.0f) { std::fprintf(stderr, "--temp must be > 0\n"); return 1; }
+    if (top_p <= 0.0f || top_p > 1.0f) { std::fprintf(stderr, "--top-p must be in (0, 1]\n"); return 1; }
+    if (max_new < 1) { std::fprintf(stderr, "--max must be >= 1\n"); return 1; }
+    if (max_new > 2048) {
+        std::fprintf(stderr, "--max clamped to 2048 (max_position_embeddings)\n");
+        max_new = 2048;
+    }
+    for (int id : dump_ids) {
+        if (id < 0 || id >= VOCAB) {
+            std::fprintf(stderr, "--logits token id %d out of range [0,%d)\n", id, VOCAB);
+            return 1;
+        }
+    }
+    if (dump_ids.size() > 2048) {
+        std::fprintf(stderr, "--logits accepts at most 2048 ids\n");
+        return 1;
     }
 
     Weights w = load_weights(root + "/model.safetensors");

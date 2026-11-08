@@ -306,6 +306,28 @@ make -C cpp
 |---|---|
 | `221e44c` | 手写 C++ 推理（KV cache + SIMD + 多线程） |
 | `20597aa` | 锁步批量化解码（batch-gemm） |
+| `78e7968` | AVX-512/hybrid SIMD、热路径分配消除、本报告 |
 
 > 说明：`model.safetensors`（真实权重）与 `converted/` 产物目前未纳入 git；如需版本化，建议用 Git LFS 管理权重、产物按需生成。
-> 当前工作区还有未提交改动：热路径分配消除、AVX-512/hybrid 内核与 `--simd` 选项（见 6.5）。
+> 输入/权重校验、死代码清理与 RoPE 频率预计算随最新一次提交入库。
+
+## 10. 外部代码评审的处理
+
+对一次外部（LLM）代码评审逐条对照当前实现后的处理：
+
+| 评审项 | 结论 | 处理 |
+|---|---|---|
+| 每 token 动态分配（scores / sample） | 评审基于旧版，已过时 | 已用 thread_local / 栈数组消除；单条 malloc 728→344 |
+| 预计算 RoPE | 部分成立 | 已预计算 inv_freq，去掉每 token 的 8 次 `pow`；全量 cos/sin 表收益 <1%，不做 |
+| RMSNorm + Residual 融合 | 成立但低收益（~1–2%） | 暂不做，需按 ISA 各写融合变体 |
+| 多行并行 MatVec | 成立，需实测 | 未做，列为后续实验项 |
+| 真正的 Batch GEMM | 成立，但实测收益有限 | B≥4 饱和，叠加多线程仅 +14% |
+| 模型 dtype / 维度校验 | 成立 | 已加 F32 + numel 校验 |
+| temp / top_p / max / token 越界校验 | 成立 | 已加 |
+| `--batch` 与 `--threads` 混淆 | 成立 | 已删除 `--batch` 别名 |
+| 未使用的 `h` 数组 | 成立 | 已删除 |
+| “JSON 解析不完整” | 对本 tokenizer 不成立 | 仅有 `\"` / `\\`，已覆盖 |
+| 运行时 CPU 指令集检测 | 对通用二进制成立 | `-march=native` 场景不适用，暂不做 |
+| 多文件 + CMake 重构 | 长期合理 | 当前 ROI 低，保持单文件 |
+
+验证：`--selftest-kv` = 0.0、`--selftest-simd` ≤ 1.7e-5、`--selftest-batch` 全一致；吞吐无回退（单线程 ~25k、22 线程 ~256k、22×batch4 ~323k tok/s）。
