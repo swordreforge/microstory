@@ -1,6 +1,8 @@
 # MacroStories 本地推理工程报告
 
 > 目标：在本机（Intel Arc 核显 / Core Ultra 7 155H）上跑通 20k 参数的 MacroStories 故事生成模型，评估各运行后端，并给出一份可复现、可验证、按投入产出比排序的结论。
+>
+> 经验、教训与测量方法论另见 [`RETROSPECTIVE.md`](./RETROSPECTIVE.md)。
 
 ---
 
@@ -328,6 +330,7 @@ make -C cpp
 | `zig/stories.zig` | Zig 0.17 单文件移植（显式分配实验） |
 | `zig/README.md` | Zig 0.17 API 变动与移植说明 |
 | `REPORT.md` | 本报告 |
+| `RETROSPECTIVE.md` | 工程复盘：经验、教训与测量方法论 |
 
 ### Git 记录
 
