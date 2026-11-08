@@ -343,8 +343,9 @@ make -C cpp
   - `std.Io.Dir` / `std.Io.File` 的 I/O 需要显式传 `io`；stdout 用 `File.stdout().writer(io, &buf).interface`；
   - `std.heap.DebugAllocator` 取代 `GeneralPurposeAllocator`；
   - `std.ArrayList` 为 unmanaged（方法显式传 allocator）；
-  - `std.sort` 提供 `heap` / `insertion`（无 `pdq`）；
+  - `std.sort` 有 `heap` / `insertion` / `pdq`（推荐 `pdq`；`heap` 在本模型采样上慢约 4×）；
   - SIMD 用 `@Vector(8, f32)` + `@mulAdd` + `@reduce(.Add, ...)`。
 - 显式分配：`ArenaAllocator` 一次性承载权重、tokenizer、KV cache 与输出缓冲，末尾统一 `deinit`；每 token 临时量走栈，热路径无堆分配。
-- 验证：`--logits` 与 Python 参考 max abs diff **6.5e-6**；单线程 wall 吞吐 ~**11.3k tok/s**（`-fstrip` 后约 358KB），低于 C++ 的 ~18k，原因是 C++ 对更多算子做了显式 AVX2，且 Zig 版未实现多线程/批量。
+- 验证：`--logits` 与 Python 参考 max abs diff **6.5e-6**；单线程解码（CPU 时间）约 **67µs/token ≈ 15k tok/s**，C++ AVX2 约 **36µs/token ≈ 28k tok/s**（`-fstrip` 后约 358KB）。
+- 差距根因（实测拆分）：**前向** Zig 22.4µs vs C++ 11.5µs（C++ 手写 AVX2 覆盖 matvec/rmsnorm/axpy，Zig 仅 `dot` 用 `@Vector`）；**采样** Zig `pdq` 20.8µs vs C++ `std::sort` 7.4µs（误用 `std.sort.heap` 时 31.7µs，换 `pdq` 后完整生成约快 15%）；**加载不是瓶颈**（Zig 1.5–1.7ms，C++ 2.2–2.4ms）。
 - 详见 `zig/README.md`。

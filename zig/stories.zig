@@ -225,7 +225,8 @@ fn sample(logits: []const f32, temp: f32, top_p: f32, rng: std.Random, probs: []
 
     i = 0;
     while (i < VOCAB) : (i += 1) order[i] = i;
-    std.sort.heap(usize, order, probs, lessThanDesc);
+    // PDQ (pattern-defeating quicksort); std.sort.heap was ~4x slower here.
+    std.sort.pdq(usize, order, probs, lessThanDesc);
 
     var cum: f32 = 0;
     var keep: usize = 0;

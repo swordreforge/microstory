@@ -23,7 +23,7 @@ zig build-exe -O ReleaseFast -fstrip stories.zig -femit-bin=stories
 | `std.json.parseFromSlice` | 仍可用；`parseFromSliceLeaky(Value, alloc, s, .{})` 更适合 arena |
 | `std.mem.readInt(u64, buf[0..8], .little)` | 需要 `*const [N]u8`；本移植直接按字节拼 |
 | `std.rand.DefaultPrng` | `std.Random.DefaultPrng.init(seed)` → `.random()` |
-| `std.sort.pdq` | 0.17 std 提供 `std.sort.heap` / `insertion`；此处用 `heap` |
+| `std.sort.heap`（误用） | 用 `std.sort.pdq`（PDQ，接近 C++ `std::sort`）；`heap` 在本模型采样上实测慢约 4× |
 | 无内建向量 | `@Vector(8, f32)` + `@splat` + `@mulAdd` + `@reduce(.Add, ...)` |
 
 ## 显式分配设计
@@ -50,8 +50,11 @@ var cache = KVCache{
 
 - `--logits` 与 Python 参考（`export_onnx.py` 的独立前向）对齐：**max abs diff 6.5e-6**。
 - 生成示例（seed 20261007）可正常产出故事。
-- 单线程 wall 吞吐（含加载）：Zig **~11.3k tok/s**，C++ **~18k tok/s**；`-fstrip` 后二进制约 **358KB**。
-- 差距原因：C++ 对 `rmsnorm`、attention 的 `axpy` 也做了显式 AVX2，而 Zig 目前只有 `dot` 用 `@Vector`；且 Zig 版未实现多线程/批量。
+- 单线程解码（CPU 时间，排除加载）：Zig **~67µs/token ≈ 15k tok/s**，C++ AVX2 **~36µs/token ≈ 28k tok/s**；`-fstrip` 后二进制约 **358KB**。
+- 差距拆分（实测）：
+  - **前向**：Zig 22.4µs vs C++ 11.5µs（约 2×）。C++ 对 matvec/rmsnorm/axpy 都手写 AVX2 并展开；Zig 只有 `dot` 用 `@Vector`。
+  - **采样**：C++ `std::sort` 7.4µs vs Zig `pdq` 20.8µs（旧版误用 `std.sort.heap` 为 31.7µs）。换 `pdq` 后完整生成约快 **15%**。
+  - **加载不是瓶颈**：Zig 1.5–1.7ms，C++ 2.2–2.4ms（Zig 反而更快）。
 
 ## 与 C++ 版的差异
 
