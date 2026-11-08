@@ -56,11 +56,31 @@ var cache = KVCache{
   - **采样**：C++ `std::sort` 7.4µs vs Zig `pdq` 20.8µs（旧版误用 `std.sort.heap` 为 31.7µs）。换 `pdq` 后完整生成约快 **15%**。
   - **加载不是瓶颈**：Zig 1.5–1.7ms，C++ 2.2–2.4ms（Zig 反而更快）。
 
+## 编译器 / LLVM 归因（GCC 16 vs Zig 0.17 的 LLVM 22）
+
+版本：GCC 16.2.1、Clang 23.1.4、Zig 0.17.1（依赖 LLVM 22）。同一份 C++ 源码、同一内核结构，换编译器（forward-only，CPU 时间）：
+
+| 配置 | forward-only |
+|---|---:|
+| GCC 16，full AVX2 | 11.24 µs/tok |
+| Clang 23，full AVX2 | 14.89 µs/tok |
+| GCC 16，dot-only AVX2 | 15.51 µs/tok |
+| Clang 23，dot-only AVX2 | 15.57 µs/tok |
+| Zig strict（dot-only 覆盖） | 20.39 µs/tok |
+| Zig `@setFloatMode(.optimized)` | 18.25 µs/tok |
+
+结论：
+
+- 等价内核结构下 GCC 与 LLVM 基本打平（15.51 vs 15.57）→ **编译器不是主因**。
+- GCC 仅在手写 intrinsics 的 full AVX2 代码上有内联/展开优势（11.24 vs 14.89）。
+- Zig 与等价 C++ 仍有 ~18–30% 差距，来自切片/`@memcpy`/未展开等语言与运行时细节；strict FP 再损失 ~10%。
+- `std.sort.heap` vs `std::sort` 是采样的大头（已换 `pdq`），属库差异而非编译器。
+
 ## 与 C++ 版的差异
 
 - 仅实现单序列 KV 解码 + `--logits`；未实现 `--threads` / `--batch-gemm` / 多级 SIMD 选择。
 - 采样 RNG 不同（`std.Random.DefaultPrng` vs `std::mt19937`），故事文本不会逐字相同，但 logits 对齐。
-- 采样排序用 `std.sort.heap`（O(V log V)），对 378 词表足够。
+- 采样排序用 `std.sort.pdq`（O(V log V)），对 378 词表足够；`heap` 实测慢约 4×。
 
 ## 文件
 

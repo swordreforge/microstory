@@ -348,4 +348,5 @@ make -C cpp
 - 显式分配：`ArenaAllocator` 一次性承载权重、tokenizer、KV cache 与输出缓冲，末尾统一 `deinit`；每 token 临时量走栈，热路径无堆分配。
 - 验证：`--logits` 与 Python 参考 max abs diff **6.5e-6**；单线程解码（CPU 时间）约 **67µs/token ≈ 15k tok/s**，C++ AVX2 约 **36µs/token ≈ 28k tok/s**（`-fstrip` 后约 358KB）。
 - 差距根因（实测拆分）：**前向** Zig 22.4µs vs C++ 11.5µs（C++ 手写 AVX2 覆盖 matvec/rmsnorm/axpy，Zig 仅 `dot` 用 `@Vector`）；**采样** Zig `pdq` 20.8µs vs C++ `std::sort` 7.4µs（误用 `std.sort.heap` 时 31.7µs，换 `pdq` 后完整生成约快 15%）；**加载不是瓶颈**（Zig 1.5–1.7ms，C++ 2.2–2.4ms）。
+- 编译器归因（GCC 16 vs Zig 0.17 的 LLVM 22）：**等价内核结构下 GCC/Clang 基本打平**（dot-only 15.51 vs 15.57µs），编译器不是主因；GCC 仅在手写 AVX2 全内核上有内联/展开优势（11.24 vs 14.89µs）。Zig 与等价 C++ 仍有 ~18–30% 语言/运行时差距，strict FP 再损失 ~10%（`@setFloatMode(.optimized)` 20.39→18.25µs，精度 6.95e-6）。
 - 详见 `zig/README.md`。
