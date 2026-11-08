@@ -1,0 +1,65 @@
+# MacroStories — Zig 0.17 单文件移植
+
+零依赖、单文件 `stories.zig` 的 MacroStories 推理实验，重点体验 Zig 的**显式分配/显式 I/O**。算法与 C++ 版一致（KV cache 解码），并通过 `--logits` 与 Python 参考实现对齐。
+
+## 构建与运行
+
+```bash
+cd zig
+zig build-exe -O ReleaseFast -fstrip stories.zig -femit-bin=stories
+./stories --root .. --seed 20261007 --max 400
+./stories --root .. --logits 1,9,10,11,12,16,17   # 与 Python 参考对齐
+```
+
+## Zig 0.17 API 变动（相对常见旧写法）
+
+| 旧写法 | Zig 0.17 |
+|---|---|
+| `pub fn main() !void`，自行获取参数/allocator | `pub fn main(init: std.process.Init) !void`，从 `init.io/.gpa/.arena/.minimal.args` 取 |
+| `std.io.getStdOut().writer()` | `std.Io.File.stdout().writer(io, &buf)`，再用 `&fw.interface` |
+| `std.fs.cwd().readFileAlloc(...)` | `std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(n))`（File/Dir 都要显式 `io`） |
+| `std.heap.GeneralPurposeAllocator` | `std.heap.DebugAllocator(.{})`（`.init`、`.allocator()`、`.deinit()`） |
+| `std.ArrayList(T).init(alloc)` | `std.ArrayList(T)` 为 unmanaged（`array_list.Aligned`），方法显式传 allocator |
+| `std.json.parseFromSlice` | 仍可用；`parseFromSliceLeaky(Value, alloc, s, .{})` 更适合 arena |
+| `std.mem.readInt(u64, buf[0..8], .little)` | 需要 `*const [N]u8`；本移植直接按字节拼 |
+| `std.rand.DefaultPrng` | `std.Random.DefaultPrng.init(seed)` → `.random()` |
+| `std.sort.pdq` | 0.17 std 提供 `std.sort.heap` / `insertion`；此处用 `heap` |
+| 无内建向量 | `@Vector(8, f32)` + `@splat` + `@mulAdd` + `@reduce(.Add, ...)` |
+
+## 显式分配设计
+
+```zig
+var arena_state = std.heap.ArenaAllocator.init(init.gpa);
+defer arena_state.deinit();
+const arena = arena_state.allocator();
+
+const model_bytes = try cwd.readFileAlloc(io, model_path, arena, .limited(1 << 24));
+const w = try loadWeights(header, model_bytes, data_base, arena);   // 所有权重来自 arena
+var cache = KVCache{
+    .k = try arena.alloc(f32, STEPS * max_seq * NKV * HD),
+    .v = try arena.alloc(f32, STEPS * max_seq * NKV * HD),
+    .scores = try arena.alloc(f32, max_seq),
+};
+```
+
+- 所有长生命周期内存（权重、tokenizer、KV cache、输出缓冲）一次性从 `arena` 分配，末尾 `deinit` 统一释放。
+- 每 token 的临时量（HID/INTER/HD）用栈数组，**热路径无堆分配**。
+- `init.gpa` 是运行时的默认分配器；`init.arena` / `init.io` 由 `std.process.Init` 提供。
+
+## 验证与性能
+
+- `--logits` 与 Python 参考（`export_onnx.py` 的独立前向）对齐：**max abs diff 6.5e-6**。
+- 生成示例（seed 20261007）可正常产出故事。
+- 单线程 wall 吞吐（含加载）：Zig **~11.3k tok/s**，C++ **~18k tok/s**；`-fstrip` 后二进制约 **358KB**。
+- 差距原因：C++ 对 `rmsnorm`、attention 的 `axpy` 也做了显式 AVX2，而 Zig 目前只有 `dot` 用 `@Vector`；且 Zig 版未实现多线程/批量。
+
+## 与 C++ 版的差异
+
+- 仅实现单序列 KV 解码 + `--logits`；未实现 `--threads` / `--batch-gemm` / 多级 SIMD 选择。
+- 采样 RNG 不同（`std.Random.DefaultPrng` vs `std::mt19937`），故事文本不会逐字相同，但 logits 对齐。
+- 采样排序用 `std.sort.heap`（O(V log V)），对 378 词表足够。
+
+## 文件
+
+- `stories.zig`：单文件实现。
+- `.gitignore`：忽略 `stories` / `*.o` / Zig 缓存目录。

@@ -298,6 +298,8 @@ make -C cpp
 | `cpp/stories.cpp` | 手写 C++ 推理（KV cache / AVX2+AVX-512 / 多线程 / batch-gemm / 低分配） |
 | `cpp/Makefile` | 构建（`-O3 -march=native -pthread`） |
 | `cpp/.gitignore` | 忽略编译产物 `stories` |
+| `zig/stories.zig` | Zig 0.17 单文件移植（显式分配实验） |
+| `zig/README.md` | Zig 0.17 API 变动与移植说明 |
 | `REPORT.md` | 本报告 |
 
 ### Git 记录
@@ -310,6 +312,7 @@ make -C cpp
 
 > 说明：`model.safetensors`（真实权重）与 `converted/` 产物目前未纳入 git；如需版本化，建议用 Git LFS 管理权重、产物按需生成。
 > 输入/权重校验、死代码清理与 RoPE 频率预计算随最新一次提交入库。
+> Zig 0.17 单文件移植与 API 变动说明见 `zig/README.md`，随本次提交入库。
 
 ## 10. 外部代码评审的处理
 
@@ -331,3 +334,17 @@ make -C cpp
 | 多文件 + CMake 重构 | 长期合理 | 当前 ROI 低，保持单文件 |
 
 验证：`--selftest-kv` = 0.0、`--selftest-simd` ≤ 1.7e-5、`--selftest-batch` 全一致；吞吐无回退（单线程 ~25k、22 线程 ~256k、22×batch4 ~323k tok/s）。
+
+## 11. Zig 0.17 单文件移植（显式分配实验）
+
+- `zig/stories.zig`：零依赖单文件，读取同一份 safetensors/tokenizer，实现 KV 解码与 `--logits`。
+- Zig 0.17 关键 API 变化：
+  - `pub fn main(init: std.process.Init) !void`，从 `init.io/.gpa/.arena/.minimal.args` 取资源；
+  - `std.Io.Dir` / `std.Io.File` 的 I/O 需要显式传 `io`；stdout 用 `File.stdout().writer(io, &buf).interface`；
+  - `std.heap.DebugAllocator` 取代 `GeneralPurposeAllocator`；
+  - `std.ArrayList` 为 unmanaged（方法显式传 allocator）；
+  - `std.sort` 提供 `heap` / `insertion`（无 `pdq`）；
+  - SIMD 用 `@Vector(8, f32)` + `@mulAdd` + `@reduce(.Add, ...)`。
+- 显式分配：`ArenaAllocator` 一次性承载权重、tokenizer、KV cache 与输出缓冲，末尾统一 `deinit`；每 token 临时量走栈，热路径无堆分配。
+- 验证：`--logits` 与 Python 参考 max abs diff **6.5e-6**；单线程 wall 吞吐 ~**11.3k tok/s**（`-fstrip` 后约 358KB），低于 C++ 的 ~18k，原因是 C++ 对更多算子做了显式 AVX2，且 Zig 版未实现多线程/批量。
+- 详见 `zig/README.md`。

@@ -1,0 +1,4 @@
+stories
+*.o
+.zig-cache/
+zig-cache/
