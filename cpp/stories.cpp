@@ -775,7 +775,9 @@ static std::string detokenize(const std::vector<int>& ids, const Tokenizer& tk) 
 }
 
 // ---- sampling -------------------------------------------------------------
-static int sample(const float* logits, float temp, float top_p, std::mt19937& rng) {
+// Reference top-p sampling: sort all probabilities, accumulate the smallest
+// prefix whose mass reaches top_p, then sample from that prefix.
+static int sample_sort(const float* logits, float temp, float top_p, std::mt19937& rng) {
     float p[VOCAB];
     int order[VOCAB];
     float mx = -1e30f;
@@ -796,6 +798,74 @@ static int sample(const float* logits, float temp, float top_p, std::mt19937& rn
     float c = 0.0f;
     for (int i = 0; i < keep; ++i) { c += p[order[i]]; if (r <= c) return order[i]; }
     return order[keep - 1];
+}
+
+// Top-p sampling without sorting the whole vocabulary.
+//
+// For this model the top-p prefix is tiny: at the default top_p=0.9 the median
+// size is 1 token, p90 is 2 and the max is ~4. Sorting all 378 entries every
+// token is therefore almost entirely wasted work and dominates the sampling
+// cost in the decode loop (in-context it costs ~25-30us/token, versus ~5us for
+// this selection). The selection:
+//   * keeps unnormalised exp weights, skipping the division pass;
+//   * repeatedly picks the maximum unused weight until the selected mass
+//     reaches top_p * total, which produces the same prefix as the sorted path
+//     when probabilities are distinct;
+//   * samples from the selected weights.
+// If the cutoff would need more than kSelectMaxScans entries (flat distribution
+// or top_p very close to 1), it returns false so the caller falls back to the
+// sorted reference instead of degrading to O(V^2).
+static constexpr int kSelectMaxScans = 64;
+
+static bool sample_select(const float* logits, float temp, float top_p,
+                          std::mt19937& rng, int* out) {
+    float w[VOCAB];
+    int order[VOCAB];
+    float sel[VOCAB];
+    float mx = -1e30f;
+    for (int i = 0; i < VOCAB; ++i) { w[i] = logits[i] / temp; if (w[i] > mx) mx = w[i]; }
+    float total = 0.0f;
+    int maxi = -1;
+    float maxw = -1.0f;
+    for (int i = 0; i < VOCAB; ++i) {
+        const float e = std::exp(w[i] - mx);
+        w[i] = e;
+        total += e;
+        if (e > maxw) { maxw = e; maxi = i; }
+    }
+    const float thresh = top_p * total;
+    int keep = 0;
+    float cum = 0.0f;
+    if (maxi >= 0) {
+        order[0] = maxi; sel[0] = maxw; cum = maxw; w[maxi] = -1.0f; keep = 1;
+    }
+    while (cum < thresh) {
+        if (keep >= kSelectMaxScans || keep >= VOCAB) return false;
+        int best = -1;
+        float bw = -1.0f;
+        for (int i = 0; i < VOCAB; ++i) if (w[i] > bw) { bw = w[i]; best = i; }
+        if (best < 0) return false;
+        w[best] = -1.0f;
+        order[keep] = best; sel[keep] = bw; keep++;
+        cum += bw;
+    }
+    std::uniform_real_distribution<float> dist(0.0f, cum);
+    const float r = dist(rng);
+    float c = 0.0f;
+    for (int i = 0; i < keep; ++i) { c += sel[i]; if (r <= c) { *out = order[i]; return true; } }
+    *out = order[keep - 1];
+    return true;
+}
+
+static int sample(const float* logits, float temp, float top_p, std::mt19937& rng) {
+    // top_p ~= 1 keeps the whole vocabulary; repeated-max would be O(V^2)
+    // there, so use the sorted reference directly. Otherwise try the selection
+    // and fall back if its cutoff grows too large.
+    if (top_p < 0.999f) {
+        int out;
+        if (sample_select(logits, temp, top_p, rng, &out)) return out;
+    }
+    return sample_sort(logits, temp, top_p, rng);
 }
 
 static std::vector<int> generate_ids(const Weights& w, int seed, int max_new,
