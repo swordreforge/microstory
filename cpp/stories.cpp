@@ -7,7 +7,10 @@
 //
 // SIMD: explicit AVX2/FMA kernels with a no-tree-vectorize scalar reference.
 // `--no-simd` forces scalar; `--selftest-simd` verifies both paths agree.
-// Batch: `--threads N` generates N independent stories concurrently.
+// Batch: `--threads N` runs N independent sequences concurrently;
+// `--batch-gemm B` decodes B sequences in one lockstep forward (weight-row
+// reuse), combinable as `--threads T --batch-gemm B`. `--selftest-batch`
+// compares batched output against per-sequence output.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -420,6 +423,151 @@ static void forward_token(const Weights& w, int token, int pos, KVCache& cache, 
     matvec(w.embed, VOCAB, HID, x, logits);
 }
 
+static int sample(const float* logits, float temp, float top_p, std::mt19937& rng);
+
+// ---- batched (lockstep) decode -------------------------------------------
+// Process B sequences in one forward pass at a common position. Weight rows
+// are loaded once and reused across the batch (M rows). Every active sequence
+// has been advanced the same number of steps, so cache index == pos for all.
+static void matmul_batch(const Tensor& W, int M, int N, int K, const float* x, float* y) {
+    for (int o = 0; o < N; ++o) {
+        const float* row = W.data + static_cast<size_t>(o) * K;
+        for (int b = 0; b < M; ++b)
+            y[static_cast<size_t>(b) * N + o] = dotv(row, x + static_cast<size_t>(b) * K, K);
+    }
+}
+
+static void forward_batch_token(const Weights& w, const int* tokens, int M, int pos,
+                                KVCache** caches, float* logits) {
+    std::vector<float> x(static_cast<size_t>(M) * HID), cur(static_cast<size_t>(M) * HID);
+    std::vector<float> r(static_cast<size_t>(M) * HID), z(static_cast<size_t>(M) * HID);
+    std::vector<float> q(static_cast<size_t>(M) * NH * HD), k(static_cast<size_t>(M) * NKV * HD);
+    std::vector<float> v(static_cast<size_t>(M) * NKV * HD), first_v(static_cast<size_t>(M) * NKV * HD);
+    std::vector<float> attn(static_cast<size_t>(M) * NH * HD), out(static_cast<size_t>(M) * HID);
+    std::vector<float> tmp(static_cast<size_t>(M) * HID);
+    std::vector<float> g(static_cast<size_t>(M) * INTER), u(static_cast<size_t>(M) * INTER), m(static_cast<size_t>(M) * INTER);
+    std::vector<float> scores(static_cast<size_t>(pos) + 1);
+
+    for (int b = 0; b < M; ++b)
+        for (int i = 0; i < HID; ++i)
+            x[static_cast<size_t>(b) * HID + i] = w.embed.data[static_cast<size_t>(tokens[b]) * HID + i];
+
+    float cosv[HD], sinv[HD];
+    for (int j = 0; j < HD / 2; ++j) {
+        float invfreq = std::pow(THETA, -(2.0f * j) / HD);
+        float a = pos * invfreq;
+        cosv[j] = cosv[j + HD / 2] = std::cos(a);
+        sinv[j] = sinv[j + HD / 2] = std::sin(a);
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+
+    for (int step = 0; step < STEPS; ++step) {
+        for (int b = 0; b < M; ++b)
+            rmsnorm(w.ln1, &x[static_cast<size_t>(b) * HID], &cur[static_cast<size_t>(b) * HID]);
+        matmul_batch(w.q, M, NH * HD, HID, cur.data(), q.data());
+        matmul_batch(w.k, M, NKV * HD, HID, cur.data(), k.data());
+        matmul_batch(w.v, M, NKV * HD, HID, cur.data(), v.data());
+        if (step == 0) {
+            std::memcpy(first_v.data(), v.data(), sizeof(float) * v.size());
+        } else {
+            for (size_t i = 0; i < v.size(); ++i) v[i] = (1.0f - MIX) * v[i] + MIX * first_v[i];
+        }
+        for (int b = 0; b < M; ++b) {
+            for (int head = 0; head < NH; ++head)
+                rope_apply(&q[static_cast<size_t>(b) * NH * HD + head * HD], cosv, sinv);
+            rope_apply(&k[static_cast<size_t>(b) * NKV * HD], cosv, sinv);
+            std::memcpy(caches[b]->k_step(step) + static_cast<size_t>(pos) * NKV * HD,
+                        &k[static_cast<size_t>(b) * NKV * HD], sizeof(float) * NKV * HD);
+            std::memcpy(caches[b]->v_step(step) + static_cast<size_t>(pos) * NKV * HD,
+                        &v[static_cast<size_t>(b) * NKV * HD], sizeof(float) * NKV * HD);
+
+            float* K = caches[b]->k_step(step);
+            float* V = caches[b]->v_step(step);
+            for (int head = 0; head < NH; ++head) {
+                const float* qh = &q[static_cast<size_t>(b) * NH * HD + head * HD];
+                float mx = -1e30f;
+                for (int s2 = 0; s2 <= pos; ++s2) {
+                    float acc = dotv(qh, K + static_cast<size_t>(s2) * NKV * HD, HD) * scale;
+                    scores[s2] = acc;
+                    if (acc > mx) mx = acc;
+                }
+                float sum = 0.0f;
+                for (int s2 = 0; s2 <= pos; ++s2) { scores[s2] = std::exp(scores[s2] - mx); sum += scores[s2]; }
+                float inv = 1.0f / sum;
+                float* ao = &attn[static_cast<size_t>(b) * NH * HD + head * HD];
+                for (int d = 0; d < HD; ++d) ao[d] = 0.0f;
+                for (int s2 = 0; s2 <= pos; ++s2) {
+                    float p = scores[s2] * inv;
+                    axpyv(ao, V + static_cast<size_t>(s2) * NKV * HD, p, HD);
+                }
+            }
+        }
+
+        matmul_batch(w.o, M, HID, NH * HD, attn.data(), out.data());
+        for (int b = 0; b < M; ++b) {
+            std::memcpy(&r[static_cast<size_t>(b) * HID], &x[static_cast<size_t>(b) * HID], sizeof(float) * HID);
+            rmsnorm(w.ln1b, &out[static_cast<size_t>(b) * HID], &tmp[static_cast<size_t>(b) * HID]);
+            for (int i = 0; i < HID; ++i)
+                x[static_cast<size_t>(b) * HID + i] = r[static_cast<size_t>(b) * HID + i] + tmp[static_cast<size_t>(b) * HID + i];
+            std::memcpy(&r[static_cast<size_t>(b) * HID], &x[static_cast<size_t>(b) * HID], sizeof(float) * HID);
+            rmsnorm(w.ln2, &x[static_cast<size_t>(b) * HID], &z[static_cast<size_t>(b) * HID]);
+        }
+        matmul_batch(w.gate, M, INTER, HID, z.data(), g.data());
+        matmul_batch(w.up, M, INTER, HID, z.data(), u.data());
+        for (int b = 0; b < M; ++b)
+            silu_mul(&g[static_cast<size_t>(b) * INTER], &u[static_cast<size_t>(b) * INTER], &m[static_cast<size_t>(b) * INTER]);
+        matmul_batch(w.down, M, HID, INTER, m.data(), out.data());
+        for (int b = 0; b < M; ++b) {
+            rmsnorm(w.ln2b, &out[static_cast<size_t>(b) * HID], &tmp[static_cast<size_t>(b) * HID]);
+            for (int i = 0; i < HID; ++i)
+                x[static_cast<size_t>(b) * HID + i] = r[static_cast<size_t>(b) * HID + i] + tmp[static_cast<size_t>(b) * HID + i];
+            rmsnorm(w.norm, &x[static_cast<size_t>(b) * HID], &tmp[static_cast<size_t>(b) * HID]);
+            std::memcpy(&x[static_cast<size_t>(b) * HID], &tmp[static_cast<size_t>(b) * HID], sizeof(float) * HID);
+        }
+    }
+
+    matmul_batch(w.embed, M, VOCAB, HID, x.data(), logits);
+}
+
+// Decode B sequences together, shrinking the batch as sequences hit EOS.
+static std::vector<std::vector<int>> generate_batch_gemm(const Weights& w, int seed, int nseq,
+                                                        int max_new, float temp, float top_p) {
+    std::vector<std::vector<int>> out(nseq);
+    std::vector<std::mt19937> rngs;
+    rngs.reserve(nseq);
+    for (int i = 0; i < nseq; ++i) rngs.emplace_back(static_cast<uint32_t>(seed + i));
+
+    std::vector<KVCache> caches;
+    caches.reserve(nseq);
+    for (int i = 0; i < nseq; ++i) caches.emplace_back(max_new + 2);
+
+    std::vector<int> last(nseq, BOS);
+    std::vector<char> done(nseq, 0);
+    std::vector<float> logits(static_cast<size_t>(nseq) * VOCAB);
+
+    std::vector<int> active;
+    std::vector<int> toks;
+    std::vector<KVCache*> cps;
+    for (int pos = 0; pos < max_new; ++pos) {
+        active.clear();
+        for (int i = 0; i < nseq; ++i) if (!done[i]) active.push_back(i);
+        if (active.empty()) break;
+        int M = static_cast<int>(active.size());
+        toks.resize(M);
+        cps.resize(M);
+        for (int j = 0; j < M; ++j) { toks[j] = last[active[j]]; cps[j] = &caches[active[j]]; }
+        forward_batch_token(w, toks.data(), M, pos, cps.data(), logits.data());
+        for (int j = 0; j < M; ++j) {
+            int id = active[j];
+            int nxt = sample(&logits[static_cast<size_t>(j) * VOCAB], temp, top_p, rngs[id]);
+            out[id].push_back(nxt);
+            last[id] = nxt;
+            if (nxt == EOS) done[id] = 1;
+        }
+    }
+    return out;
+}
+
 // ---- tokenizer ------------------------------------------------------------
 struct Tokenizer {
     std::vector<std::string> id2tok;
@@ -562,9 +710,9 @@ static std::vector<int> generate_ids(const Weights& w, int seed, int max_new,
 
 int main(int argc, char** argv) {
     std::string root = ".";
-    int seed = 20261007, max_new = 512, nthreads = 1;
+    int seed = 20261007, max_new = 512, nthreads = 1, batch_gemm = 0;
     float temp = 0.5f, top_p = 0.9f;
-    bool use_kv = true, selftest_kv = false, selftest_simd = false, quiet = false;
+    bool use_kv = true, selftest_kv = false, selftest_simd = false, selftest_batch = false, quiet = false;
     std::vector<int> dump_ids;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -575,10 +723,12 @@ int main(int argc, char** argv) {
         else if (a == "--top-p" && i + 1 < argc) top_p = std::atof(argv[++i]);
         else if (a == "--threads" && i + 1 < argc) nthreads = std::max(1, std::atoi(argv[++i]));
         else if (a == "--batch" && i + 1 < argc) nthreads = std::max(1, std::atoi(argv[++i]));
+        else if (a == "--batch-gemm" && i + 1 < argc) batch_gemm = std::max(1, std::atoi(argv[++i]));
         else if (a == "--no-kv") use_kv = false;
         else if (a == "--no-simd") g_use_simd = false;
         else if (a == "--selftest-kv") selftest_kv = true;
         else if (a == "--selftest-simd") selftest_simd = true;
+        else if (a == "--selftest-batch") selftest_batch = true;
         else if (a == "--quiet") quiet = true;
         else if (a == "--logits" && i + 1 < argc) {
             std::string s = argv[++i];
@@ -643,6 +793,20 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (selftest_batch) {
+        int B = 5;
+        auto bg = generate_batch_gemm(w, 700, B, max_new, temp, top_p);
+        bool ok = true;
+        for (int i = 0; i < B; ++i) {
+            auto seq = generate_ids(w, 700 + i, max_new, temp, top_p, true);
+            bool same = (seq == bg[i]);
+            ok = ok && same;
+            std::printf("batch seq %d: identical=%s len=%zu\n", i, same ? "YES" : "NO", bg[i].size());
+        }
+        std::printf("ALL IDENTICAL: %s\n", ok ? "YES" : "NO");
+        return 0;
+    }
+
     if (!dump_ids.empty()) {
         std::vector<float> logits(VOCAB);
         forward(w, dump_ids.data(), static_cast<int>(dump_ids.size()), logits.data());
@@ -651,10 +815,33 @@ int main(int argc, char** argv) {
     }
 
     auto t0 = std::chrono::steady_clock::now();
-    std::vector<std::vector<int>> results(nthreads);
-    if (nthreads == 1) {
+    std::vector<std::vector<int>> results;
+    const char* mode = "single";
+    if (batch_gemm > 0) {
+        mode = "batch-gemm";
+        int groups = nthreads;
+        results.resize(static_cast<size_t>(groups) * batch_gemm);
+        if (groups == 1) {
+            results = generate_batch_gemm(w, seed, batch_gemm, max_new, temp, top_p);
+        } else {
+            std::vector<std::vector<std::vector<int>>> grouped(groups);
+            std::vector<std::thread> pool;
+            pool.reserve(groups);
+            for (int t = 0; t < groups; ++t)
+                pool.emplace_back([&, t]() {
+                    grouped[t] = generate_batch_gemm(w, seed + t * batch_gemm, batch_gemm, max_new, temp, top_p);
+                });
+            for (auto& th : pool) th.join();
+            for (int t = 0; t < groups; ++t)
+                for (int j = 0; j < batch_gemm; ++j)
+                    results[static_cast<size_t>(t) * batch_gemm + j] = std::move(grouped[t][j]);
+        }
+    } else if (nthreads == 1) {
+        results.resize(1);
         results[0] = generate_ids(w, seed, max_new, temp, top_p, use_kv);
     } else {
+        mode = "threads";
+        results.resize(nthreads);
         std::vector<std::thread> pool;
         pool.reserve(nthreads);
         for (int t = 0; t < nthreads; ++t)
@@ -667,16 +854,16 @@ int main(int argc, char** argv) {
     double secs = std::chrono::duration<double>(t1 - t0).count();
 
     size_t total = 0;
-    for (int t = 0; t < nthreads; ++t) {
+    for (size_t t = 0; t < results.size(); ++t) {
         total += results[t].size();
         if (!quiet) {
-            if (nthreads > 1) std::printf("--- story %d (seed %d) ---\n", t, seed + t);
+            if (results.size() > 1) std::printf("--- story %zu (seed %d) ---\n", t, seed + static_cast<int>(t));
             std::string story = detokenize(results[t], tk);
             std::printf("%s\n", story.c_str());
         }
     }
-    std::fprintf(stderr, "[batch %d, tokens %zu, %.1f ms, %.0f tok/s, kv=%s, simd=%s]\n",
-                 nthreads, total, secs * 1000.0, total / secs,
+    std::fprintf(stderr, "[mode %s, seq %zu, tokens %zu, %.1f ms, %.0f tok/s, kv=%s, simd=%s]\n",
+                 mode, results.size(), total, secs * 1000.0, total / secs,
                  use_kv ? "on" : "off", g_use_simd ? "on" : "off");
     return 0;
 }
