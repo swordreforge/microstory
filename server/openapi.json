@@ -1,0 +1,368 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "MacroStories API",
+    "version": "1.0.0",
+    "description": "HTTP API for the 19,969-parameter MacroStories story generator.\nThe reference server is Linux-only and uses io_uring for accept/recv/send\nand request logging. The JSON wire format is an OpenAI-compatible subset.\n"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080",
+      "description": "Local reference server"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Liveness probe",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Service is ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "summary": "List available models (OpenAI-compatible)",
+        "operationId": "listModels",
+        "responses": {
+          "200": {
+            "description": "Model list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelList"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "summary": "Generate a children's story",
+        "operationId": "createCompletion",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoryRequest"
+              },
+              "examples": {
+                "default": {
+                  "value": {
+                    "seed": 20261007,
+                    "max_tokens": 400,
+                    "temperature": 0.5,
+                    "top_p": 0.9
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Generated story",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompletionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          }
+        }
+      }
+    },
+    "/v1/stories": {
+      "post": {
+        "summary": "Generate a story (alias of /v1/completions)",
+        "operationId": "createStory",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Generated story",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompletionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Health": {
+        "type": "object",
+        "required": [
+          "status",
+          "model"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ok"
+          },
+          "model": {
+            "type": "string",
+            "examples": [
+              "macrostories-20k"
+            ]
+          }
+        }
+      },
+      "Model": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "owned_by"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string",
+            "const": "model"
+          },
+          "owned_by": {
+            "type": "string"
+          }
+        }
+      },
+      "ModelList": {
+        "type": "object",
+        "required": [
+          "object",
+          "data"
+        ],
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "list"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Model"
+            }
+          }
+        }
+      },
+      "StoryRequest": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "Accepted for OpenAI client compatibility. The model is a\nfrom-scratch story generator, so the prompt is currently ignored;\ngeneration always starts from <|start_story|>.\n"
+          },
+          "max_tokens": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2048,
+            "default": 400,
+            "description": "Maximum number of story tokens to generate."
+          },
+          "temperature": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "default": 0.5
+          },
+          "top_p": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 1,
+            "default": 0.9
+          },
+          "seed": {
+            "type": "integer",
+            "default": 20261007
+          }
+        }
+      },
+      "CompletionResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices",
+          "usage"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "examples": [
+              "cmpl-20261007-128"
+            ]
+          },
+          "object": {
+            "type": "string",
+            "const": "text_completion"
+          },
+          "created": {
+            "type": "integer",
+            "examples": [
+              0
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "index",
+                "text",
+                "finish_reason"
+              ],
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "const": 0
+                },
+                "text": {
+                  "type": "string",
+                  "description": "The generated story."
+                },
+                "finish_reason": {
+                  "type": "string",
+                  "enum": [
+                    "stop",
+                    "length"
+                  ]
+                },
+                "logprobs": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "required": [
+              "prompt_tokens",
+              "completion_tokens",
+              "total_tokens"
+            ],
+            "properties": {
+              "prompt_tokens": {
+                "type": "integer",
+                "const": 1
+              },
+              "completion_tokens": {
+                "type": "integer"
+              },
+              "total_tokens": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "type",
+              "message"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "examples": [
+                  "invalid_request_error"
+                ]
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid request body or parameters",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Unknown path",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "MethodNotAllowed": {
+        "description": "Wrong HTTP method",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    }
+  }
+}

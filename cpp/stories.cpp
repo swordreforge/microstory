@@ -970,6 +970,7 @@ static std::vector<int> generate_ids(const Weights& w, int seed, int max_new,
     return body;
 }
 
+#ifndef MACROSTORIES_NO_MAIN
 int main(int argc, char** argv) {
     std::string root = ".";
     int seed = 20261007, max_new = 512, nthreads = 1, batch_gemm = 0;
@@ -1170,3 +1171,4 @@ int main(int argc, char** argv) {
                  use_kv ? "on" : "off", simd_name(g_simd));
     return 0;
 }
+#endif  // MACROSTORIES_NO_MAIN

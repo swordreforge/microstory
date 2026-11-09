@@ -15,6 +15,7 @@
 - **Vulkan 不划算**：本机驱动齐全（Mesa ANV，Vulkan 1.4），但 ncnn Vulkan 比 CPU 慢约 **18×**，小模型被 kernel 启动开销拖死。
 - **int8 / AVX-VNNI 可跳过**：模型太小，量化误差（logits 差 0.93）远大于收益。
 - **AVX-512 已实测但默认不用**：远程 Xeon 上比 AVX2 慢约 **17%**（持续 512-bit FMA 触发降频），故默认 AVX2，仅保留 `--simd avx512|hybrid` 选项。
+- **Web API**：`server/stories_server.cpp` 提供纯 Linux io_uring + OpenAPI 的 HTTP 接口（OpenAI 兼容子集）。
 
 ---
 
@@ -329,6 +330,9 @@ make -C cpp
 | `cpp/.gitignore` | 忽略编译产物 `stories` |
 | `zig/stories.zig` | Zig 0.17 单文件移植（显式分配实验） |
 | `zig/README.md` | Zig 0.17 API 变动与移植说明 |
+| `server/stories_server.cpp` | io_uring HTTP API（OpenAI 兼容子集） |
+| `server/openapi.yaml` / `openapi.json` | OpenAPI 3.1 规范 |
+| `server/README.md` | API 用法、设计、并发与限制 |
 | `REPORT.md` | 本报告 |
 | `RETROSPECTIVE.md` | 工程复盘：经验、教训与测量方法论 |
 
@@ -345,6 +349,7 @@ make -C cpp
 > Zig 0.17 单文件移植与 API 变动说明见 `zig/README.md`，随本次提交入库。
 > top-p 选择优化（`sample_select` + 回退）随最新一次提交入库。
 > 向量化/近似 exp（AVX2 多项式，默认开启，`--exp-scalar` 回退）随最新一次提交入库。
+> Web API（io_uring + OpenAPI）随最新一次提交入库。
 
 ## 10. 外部代码评审的处理
 
@@ -383,3 +388,15 @@ make -C cpp
 - 差距根因（实测拆分）：**前向** Zig 22.4µs vs C++ 11.5µs（C++ 手写 AVX2 覆盖 matvec/rmsnorm/axpy，Zig 仅 `dot` 用 `@Vector`）；**采样** Zig `pdq` 20.8µs vs C++ `std::sort` 7.4µs（误用 `std.sort.heap` 时 31.7µs，换 `pdq` 后完整生成约快 15%）；**加载不是瓶颈**（Zig 1.5–1.7ms，C++ 2.2–2.4ms）。
 - 编译器归因（GCC 16 vs Zig 0.17 的 LLVM 22）：**等价内核结构下 GCC/Clang 基本打平**（dot-only 15.51 vs 15.57µs），编译器不是主因；GCC 仅在手写 AVX2 全内核上有内联/展开优势（11.24 vs 14.89µs）。Zig 与等价 C++ 仍有 ~18–30% 语言/运行时差距，strict FP 再损失 ~10%（`@setFloatMode(.optimized)` 20.39→18.25µs，精度 6.95e-6）。
 - 详见 `zig/README.md`。
+
+## 12. Web API（io_uring + OpenAPI）
+
+- `server/stories_server.cpp`：纯 Linux HTTP API；`accept` / `recv` / `send` / 日志 `write` 全部走 **io_uring**；模型只加载一次、只读共享；每请求独立 KV cache/RNG。
+- 端点（OpenAI 兼容子集）：`GET /health`、`GET /v1/models`、`POST /v1/completions`、`POST /v1/stories`、`GET /openapi.json`。
+- 规范：`server/openapi.yaml`（OpenAPI 3.1）+ `server/openapi.json`（机器可读，并直接由服务提供）。
+- JSON：手写解析/序列化，无第三方 JSON 依赖；错误统一 `{"error":{"type","message"}}`。
+- 并发：单进程内生成串行；`SO_REUSEPORT` 支持多进程同端口，内核分发连接。
+- 实测：1 进程 4 客户端 20 请求 16.5ms（~1.2k req/s，~152k tok/s）；4 进程 12.4ms（~1.6k req/s）。模型单线程本身 ~110k tok/s。
+- 验证：`/proc/<pid>/fd` 可见 `anon_inode:[io_uring]`；400/404/405、keep-alive、访问日志均正常。
+- 限制：无流式/SSE、无 `n>1`、`prompt` 被忽略（模型从 BOS 生成）、无 TLS/鉴权（默认绑 `127.0.0.1`）。
+- 详见 `server/README.md`。
