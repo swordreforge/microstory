@@ -859,7 +859,7 @@ int main(int argc, char** argv) {
     std::string log_path;
     std::string openapi_path = "openapi.json";
     const char* bind_addr = "127.0.0.1";
-    int port = 8080;
+    int port = 8847;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

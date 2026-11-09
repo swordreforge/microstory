@@ -1,0 +1,17 @@
+[Unit]
+Description=MacroStories HTTP API
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/html/tinystory/en
+ExecStart=/var/www/html/tinystory/en/server/stories_server --root . --bind 127.0.0.1 --port 8847 --openapi openapi.json --log /var/log/tinystory/access.log
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

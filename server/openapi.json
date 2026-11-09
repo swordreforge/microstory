@@ -7,7 +7,11 @@
   },
   "servers": [
     {
-      "url": "http://127.0.0.1:8080",
+      "url": "https://en.tiny-story.swordreforge.top",
+      "description": "Production (h2o reverse proxy)"
+    },
+    {
+      "url": "http://127.0.0.1:8847",
       "description": "Local reference server"
     }
   ],

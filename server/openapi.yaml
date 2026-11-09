@@ -7,7 +7,9 @@ info:
     The reference server is Linux-only and uses io_uring for accept/recv/send
     and request logging. The JSON wire format is an OpenAI-compatible subset.
 servers:
-  - url: http://127.0.0.1:8080
+  - url: https://en.tiny-story.swordreforge.top
+    description: Production (h2o reverse proxy)
+  - url: http://127.0.0.1:8847
     description: Local reference server
 
 paths:

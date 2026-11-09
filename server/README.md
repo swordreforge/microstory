@@ -20,13 +20,13 @@ with `MACROSTORIES_NO_MAIN`), so keep the `cpp/` directory next to `server/`.
 From the `server/` directory (default `--root ..` points at the model files):
 
 ```bash
-./stories_server --root .. --port 8080 --openapi openapi.json --log access.log
+./stories_server --root .. --port 8847 --openapi openapi.json --log access.log
 ```
 
 Or from the repository root:
 
 ```bash
-./server/stories_server --root . --port 8080 --openapi server/openapi.json
+./server/stories_server --root . --port 8847 --openapi server/openapi.json
 ```
 
 Options:
@@ -35,10 +35,51 @@ Options:
 |---|---|---|
 | `--root DIR` | `..` | directory containing `model.safetensors` + `tokenizer.json` |
 | `--bind ADDR` | `127.0.0.1` | listen address (use `0.0.0.0` behind a proxy) |
-| `--port N` | `8080` | listen port |
+| `--port N` | `8847` | listen port |
 | `--log FILE` | none | append access log via io_uring |
 | `--openapi FILE` | `openapi.json` | spec served at `/openapi.json` |
 | `--debug` | off | print io_uring completion events to stderr |
+
+## Deployment (reference)
+
+The public instance runs on the Linux box behind h2o:
+
+| Item | Value |
+|---|---|
+| Model + binary | `/var/www/html/tinystory/en` |
+| Service | `tinystory.service`, listening on `127.0.0.1:8847` |
+| Public URL | `https://en.tiny-story.swordreforge.top` |
+| TLS | h2o built-in ACME (Let's Encrypt, HTTP-01) |
+
+Copy the model, tokenizer, OpenAPI document and sources to
+`/var/www/html/tinystory/en`, build with `make -C server`, then install
+`deploy/tinystory.service`:
+
+```bash
+install -d -o www-data -g www-data /var/log/tinystory
+systemctl daemon-reload
+systemctl enable --now tinystory
+```
+
+Append `deploy/h2o-host.conf` under the `hosts:` section of
+`/usr/local/etc/h2o.conf`, validate and reload:
+
+```bash
+h2o -t -c /usr/local/etc/h2o.conf
+systemctl reload h2o
+```
+
+The h2o ACME helper (lego) reads the host list at **startup**. After adding a
+new domain, restart h2o once so the domain is included in the renewal list;
+later edits can use `reload`:
+
+```bash
+systemctl restart h2o
+```
+
+For SSE, keep `compress: OFF` on the host and avoid `proxy.max-buffer-size`
+so events are forwarded as they are produced. Verified over loopback: a short
+story's events arrived incrementally (~1.2–1.9 ms), not all at the end.
 
 ## Endpoints
 
@@ -87,14 +128,14 @@ was reached.
 ### curl examples
 
 ```bash
-curl -s http://127.0.0.1:8080/health | jq .
-curl -s http://127.0.0.1:8080/v1/models | jq .
+curl -s http://127.0.0.1:8847/health | jq .
+curl -s http://127.0.0.1:8847/v1/models | jq .
 
-curl -s -X POST http://127.0.0.1:8080/v1/stories \
+curl -s -X POST http://127.0.0.1:8847/v1/stories \
   -H 'Content-Type: application/json' \
   -d '{"seed":20261007,"max_tokens":400,"temperature":0.5,"top_p":0.9}' | jq .
 
-curl -s http://127.0.0.1:8080/openapi.json | jq .info
+curl -s http://127.0.0.1:8847/openapi.json | jq .info
 ```
 
 Errors use `{"error":{"type":"…","message":"…"}}` with status 400/404/405/413.
@@ -105,7 +146,7 @@ Errors use `{"error":{"type":"…","message":"…"}}` with status 400/404/405/41
 (`Content-Type: text/event-stream`, `Transfer-Encoding: chunked`):
 
 ```bash
-curl -N -s -X POST http://127.0.0.1:8080/v1/completions \
+curl -N -s -X POST http://127.0.0.1:8847/v1/completions \
   -H 'Content-Type: application/json' \
   -d '{"stream":true,"seed":20261007,"max_tokens":200}'
 ```
