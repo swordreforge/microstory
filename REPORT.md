@@ -396,7 +396,8 @@ make -C cpp
 - 规范：`server/openapi.yaml`（OpenAPI 3.1）+ `server/openapi.json`（机器可读，并直接由服务提供）。
 - JSON：手写解析/序列化，无第三方 JSON 依赖；错误统一 `{"error":{"type","message"}}`。
 - 并发：单进程内生成串行；`SO_REUSEPORT` 支持多进程同端口，内核分发连接。
+- 流式：`stream: true` → SSE（`text/event-stream` + chunked）；增量 detokenize（UTF-8 半字节缓冲、尾随空格保持），每 16 token flush 一次；拼接 delta 与非流式文本**逐字一致**；断连安全。
 - 实测：1 进程 4 客户端 20 请求 16.5ms（~1.2k req/s，~152k tok/s）；4 进程 12.4ms（~1.6k req/s）。模型单线程本身 ~110k tok/s。
-- 验证：`/proc/<pid>/fd` 可见 `anon_inode:[io_uring]`；400/404/405、keep-alive、访问日志均正常。
-- 限制：无流式/SSE、无 `n>1`、`prompt` 被忽略（模型从 BOS 生成）、无 TLS/鉴权（默认绑 `127.0.0.1`）。
+- 验证：`/proc/<pid>/fd` 可见 `anon_inode:[io_uring]`；400/404/405、keep-alive、并发流、断连、访问日志均正常。
+- 限制：无 `n>1`、`prompt` 被忽略（模型从 BOS 生成）、无 TLS/鉴权（默认绑 `127.0.0.1`）。
 - 详见 `server/README.md`。

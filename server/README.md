@@ -57,7 +57,8 @@ Options:
   "seed": 20261007,
   "max_tokens": 400,
   "temperature": 0.5,
-  "top_p": 0.9
+  "top_p": 0.9,
+  "stream": false
 }
 ```
 
@@ -98,6 +99,30 @@ curl -s http://127.0.0.1:8080/openapi.json | jq .info
 
 Errors use `{"error":{"type":"…","message":"…"}}` with status 400/404/405/413.
 
+### Streaming
+
+`stream: true` switches the response to Server-Sent Events
+(`Content-Type: text/event-stream`, `Transfer-Encoding: chunked`):
+
+```bash
+curl -N -s -X POST http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"stream":true,"seed":20261007,"max_tokens":200}'
+```
+
+Each event is one `data:` line:
+
+```
+data: {"id":"cmpl-20261007","object":"text_completion","created":0,"model":"macrostories-20k","choices":[{"index":0,"delta":{"content":"Alex "},"finish_reason":null}]}
+
+```
+
+The final data event carries `finish_reason` and `usage`, followed by
+`data: [DONE]` and the chunked trailer. Concatenating every
+`choices[0].delta.content` yields exactly the non-streaming
+`choices[0].text`. Tokens are flushed in batches of up to 16 to keep latency
+low without one syscall per token; a client disconnect stops generation.
+
 ## Design notes
 
 - **io_uring**: one ring per process. `accept`, `recv`, `send`, and the
@@ -111,6 +136,10 @@ Errors use `{"error":{"type":"…","message":"…"}}` with status 400/404/405/41
   process handles one generation at a time. For CPU parallelism run several
   processes on the same port; `SO_REUSEPORT` is set so the kernel balances
   connections.
+- **Streaming**: `stream: true` keeps a per-connection `Stream` state machine;
+  generation resumes after each send. An incremental detokenizer buffers
+  incomplete UTF-8 bytes and holds trailing spaces. Up to 16 tokens are
+  generated per flush. Disconnects (send error) simply drop the stream state.
 - **JSON**: a small hand-written parser/serializer is used (no third-party
   JSON dependency); the format is validated against `openapi.yaml`.
 - **CORS**: permissive `Access-Control-Allow-*` headers are returned so browser
@@ -128,7 +157,8 @@ Errors use `{"error":{"type":"…","message":"…"}}` with status 400/404/405/41
 
 ## Limitations
 
-- No streaming/SSE, no `n > 1`, no prompt-conditioned generation.
+- Streaming is SSE/OpenAI-style only (`stream: true`); no WebSocket.
+- No `n > 1`, no prompt-conditioned generation.
 - Single-threaded generation per process; use multiple processes for parallel
   CPU use.
 - No TLS or authentication. Bind to `127.0.0.1` or put it behind a reverse

@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -279,11 +280,118 @@ struct Engine {
 };
 
 // ---------------------------------------------------------------------------
+// Incremental detokenizer for streaming.
+//
+// ByteLevel tokens can split a UTF-8 sequence across token boundaries, so we
+// buffer incomplete bytes until the next token completes them. Trailing spaces
+// are held back until we know whether more text follows, then flushed by
+// finish(); this mirrors detokenize()'s leading/trailing trim closely enough
+// for streaming clients.
+// ---------------------------------------------------------------------------
+static size_t valid_utf8_prefix(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t n = 0;
+        if (c < 0x80) n = 1;
+        else if ((c & 0xE0) == 0xC0) n = 2;
+        else if ((c & 0xF0) == 0xE0) n = 3;
+        else if ((c & 0xF8) == 0xF0) n = 4;
+        else break;  // invalid lead byte: keep nothing past it
+        if (i + n > s.size()) break;  // incomplete: wait for more bytes
+        bool ok = true;
+        for (size_t j = 1; j < n; ++j) {
+            if ((static_cast<unsigned char>(s[i + j]) & 0xC0) != 0x80) { ok = false; break; }
+        }
+        if (!ok) break;
+        i += n;
+    }
+    return i;
+}
+
+struct IncDecoder {
+    std::string pending;  // incomplete UTF-8 bytes
+    std::string text;     // decoded, not yet emitted
+    bool started = false;
+
+    std::string take() {
+        if (!started) {
+            const size_t a = text.find_first_not_of(" \t\n\r");
+            if (a == std::string::npos) { text.clear(); return {}; }
+            text.erase(0, a);
+            started = true;
+        }
+        const size_t b = text.find_last_not_of(" \t\n\r");
+        if (b == std::string::npos) return {};  // all trailing spaces; hold
+        std::string out = text.substr(0, b + 1);
+        text.erase(0, b + 1);
+        return out;
+    }
+
+    std::string feed(int id, const Tokenizer& tk) {
+        if (id == 4) { text += "Alex"; return take(); }
+        if (id == 5) { text += "Robin"; return take(); }
+        if (id == 6) { text += "Casey"; return take(); }
+        if (id == BOS || id == EOS || id == 0 || id == 3) return {};
+        if (id < 0 || id >= VOCAB) return {};
+        decode_token_bytes(tk.id2tok[id], tk, pending);
+        const size_t n = valid_utf8_prefix(pending);
+        text.append(pending.data(), n);
+        pending.erase(0, n);
+        return take();
+    }
+
+    std::string finish() {
+        text += pending;
+        pending.clear();
+        if (!started) {
+            const size_t a = text.find_first_not_of(" \t\n\r");
+            if (a == std::string::npos) { text.clear(); return {}; }
+            text.erase(0, a);
+            started = true;
+        }
+        const size_t b = text.find_last_not_of(" \t\n\r");
+        std::string out = (b == std::string::npos) ? std::string() : text.substr(0, b + 1);
+        text.clear();
+        return out;
+    }
+};
+
+struct Stream {
+    bool active = false;
+    bool done = false;
+    bool eos = false;
+    int seed = 0;
+    int max_tokens = 0;
+    int pos = 0;
+    int n_tokens = 0;
+    int cur = BOS;
+    float temp = 0.5f;
+    float top_p = 0.9f;
+    std::unique_ptr<KVCache> cache;
+    std::mt19937 rng;
+    std::vector<float> logits;
+    IncDecoder dec;
+    std::string id;
+};
+
+struct Conn {
+    int fd = -1;
+    std::string in;            // bytes received but not yet consumed
+    std::string out;           // bytes pending send
+    size_t out_off = 0;
+    std::vector<char> rbuf;    // per-connection recv buffer
+    Stream stream;
+    bool closed = false;
+};
+
+// ---------------------------------------------------------------------------
 // HTTP
 // ---------------------------------------------------------------------------
 struct Response {
     int status = 200;
     std::string body;
+    bool stream = false;  // response has already been written to Conn::out
 };
 
 static const char* status_text(int s) {
@@ -363,7 +471,111 @@ static void serialize(const Response& r, std::string& out) {
     out += r.body;
 }
 
-static Response route(Engine& engine, const ParsedRequest& req) {
+// ---------------------------------------------------------------------------
+// Streaming (SSE, OpenAI `stream: true`)
+// ---------------------------------------------------------------------------
+static constexpr int kStreamBatch = 16;  // tokens generated per flush
+
+static void append_chunk(std::string& out, const std::string& data) {
+    if (data.empty()) return;
+    char hdr[32];
+    std::snprintf(hdr, sizeof hdr, "%zx\r\n", data.size());
+    out += hdr;
+    out += data;
+    out += "\r\n";
+}
+
+static std::string sse_delta(const std::string& id, const char* model, const std::string& text) {
+    std::string e = "data: {\"id\":\"";
+    e += id;
+    e += "\",\"object\":\"text_completion\",\"created\":0,\"model\":\"";
+    e += model;
+    e += "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"";
+    mjson::escape(text, e);
+    e += "\"},\"finish_reason\":null}]}\n\n";
+    return e;
+}
+
+static std::string sse_final(const std::string& id, const char* model, bool eos, int n_tokens) {
+    std::string e = "data: {\"id\":\"";
+    e += id;
+    e += "\",\"object\":\"text_completion\",\"created\":0,\"model\":\"";
+    e += model;
+    e += "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"";
+    e += eos ? "stop" : "length";
+    e += "\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":";
+    e += std::to_string(n_tokens);
+    e += ",\"total_tokens\":";
+    e += std::to_string(n_tokens + 1);
+    e += "}}\n\n";
+    return e;
+}
+
+static void start_stream(Conn* c, int seed, int max_tokens, float temp, float top_p) {
+    Stream& s = c->stream;
+    s.active = true;
+    s.done = false;
+    s.eos = false;
+    s.seed = seed;
+    s.max_tokens = max_tokens;
+    s.pos = 0;
+    s.n_tokens = 0;
+    s.cur = BOS;
+    s.temp = temp;
+    s.top_p = top_p;
+    s.cache = std::make_unique<KVCache>(max_tokens + 2);
+    s.logits.assign(VOCAB, 0.0f);
+    s.rng.seed(static_cast<std::mt19937::result_type>(static_cast<uint32_t>(seed)));
+    s.dec = IncDecoder{};
+    s.id = "cmpl-" + std::to_string(seed);
+
+    c->out += "HTTP/1.1 200 OK\r\n"
+              "Content-Type: text/event-stream\r\n"
+              "Transfer-Encoding: chunked\r\n"
+              "Cache-Control: no-cache\r\n"
+              "Connection: keep-alive\r\n"
+              "Access-Control-Allow-Origin: *\r\n"
+              "Access-Control-Allow-Headers: content-type\r\n"
+              "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+              "\r\n";
+}
+
+// Generate one batch, append SSE chunks (and the terminal frame when done).
+static void stream_batch(Engine& engine, Conn* c) {
+    Stream& s = c->stream;
+    if (!s.active || s.done) return;
+
+    std::string delta;
+    int produced = 0;
+    while (!s.done && produced < kStreamBatch) {
+        forward_token(engine.w, s.cur, s.pos, *s.cache, s.logits.data());
+        const int nxt = sample(s.logits.data(), s.temp, s.top_p, s.rng);
+        ++s.pos;
+        ++s.n_tokens;
+        if (nxt == EOS) {
+            s.eos = true;
+            s.done = true;
+            break;
+        }
+        s.cur = nxt;
+        delta += s.dec.feed(nxt, engine.tk);
+        ++produced;
+        if (s.pos >= s.max_tokens) {
+            s.done = true;
+            break;
+        }
+    }
+    if (!delta.empty()) append_chunk(c->out, sse_delta(s.id, engine.name, delta));
+    if (s.done) {
+        const std::string tail = s.dec.finish();
+        if (!tail.empty()) append_chunk(c->out, sse_delta(s.id, engine.name, tail));
+        append_chunk(c->out, sse_final(s.id, engine.name, s.eos, s.n_tokens));
+        append_chunk(c->out, "data: [DONE]\n\n");
+        c->out += "0\r\n\r\n";
+    }
+}
+
+static Response route(Engine& engine, const ParsedRequest& req, Conn* c) {
     if (req.method == "OPTIONS") {
         Response r;
         r.body = "{}";
@@ -435,6 +647,16 @@ static Response route(Engine& engine, const ParsedRequest& req) {
             return error_response(400, "invalid_request_error", "prompt must be a string");
         }
     }
+    bool stream = false;
+    if (const auto* p = v.get("stream")) {
+        if (p->type == mjson::Value::Bool) {
+            stream = p->b;
+        } else if (p->type == mjson::Value::Num) {
+            stream = p->num != 0;
+        } else {
+            return error_response(400, "invalid_request_error", "stream must be a boolean");
+        }
+    }
     if (max_tokens < 1 || max_tokens > 2048) {
         return error_response(400, "invalid_request_error", "max_tokens must be in [1, 2048]");
     }
@@ -443,6 +665,20 @@ static Response route(Engine& engine, const ParsedRequest& req) {
     }
     if (top_p <= 0.0f || top_p > 1.0f) {
         return error_response(400, "invalid_request_error", "top_p must be in (0, 1]");
+    }
+
+    if (stream) {
+        if (c == nullptr) {
+            return error_response(500, "internal_error", "stream requires a connection");
+        }
+        if (c->stream.active) {
+            return error_response(400, "invalid_request_error", "a stream is already active");
+        }
+        start_stream(c, seed, max_tokens, temperature, top_p);
+        stream_batch(engine, c);
+        Response r;
+        r.stream = true;
+        return r;
     }
 
     std::string text;
@@ -479,15 +715,6 @@ static constexpr size_t kMaxIn = 1 << 20;       // max buffered request
 static bool g_debug = false;
 
 #define DBG(...) do { if (g_debug) std::fprintf(stderr, __VA_ARGS__); } while (0)
-
-struct Conn {
-    int fd = -1;
-    std::string in;            // bytes received but not yet consumed
-    std::string out;           // bytes pending send
-    size_t out_off = 0;
-    std::vector<char> rbuf;    // per-connection recv buffer
-    bool closed = false;
-};
 
 struct Op {
     enum Kind { Accept, Recv, Send, Log, Close } kind = Recv;
@@ -602,9 +829,16 @@ struct Server {
                 return true;
             }
             const auto t0 = std::chrono::steady_clock::now();
-            Response r = route(*engine, req);
+            Response r = route(*engine, req, c);
             const auto t1 = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (r.stream) {
+                char line[256];
+                std::snprintf(line, sizeof line, "%s %s %d %.2fms stream\n",
+                              req.method.c_str(), req.path.c_str(), r.status, ms);
+                arm_log(line);
+                return true;  // caller arms send; the stream resumes after each send
+            }
             std::string wire;
             serialize(r, wire);
             c->out += wire;
@@ -713,9 +947,28 @@ int main(int argc, char** argv) {
                 } else {
                     c->out.clear();
                     c->out_off = 0;
-                    // More pipelined requests may already be buffered.
-                    if (server.process(c)) server.arm_send(c);
-                    else server.arm_recv(c);
+                    if (c->stream.active) {
+                        if (!c->stream.done) {
+                            do {
+                                stream_batch(*server.engine, c);
+                            } while (!c->stream.done && c->out.empty());
+                        }
+                        if (c->stream.done && c->out.empty()) {
+                            // The terminal chunk has been flushed.
+                            c->stream.active = false;
+                            c->stream.cache.reset();
+                            if (server.process(c)) server.arm_send(c);
+                            else server.arm_recv(c);
+                        } else if (!c->out.empty()) {
+                            server.arm_send(c);
+                        } else {
+                            server.arm_recv(c);
+                        }
+                    } else {
+                        // More pipelined requests may already be buffered.
+                        if (server.process(c)) server.arm_send(c);
+                        else server.arm_recv(c);
+                    }
                 }
                 break;
             }

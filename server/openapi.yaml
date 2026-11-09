@@ -59,6 +59,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE stream. Each event is `data: <CompletionChunk>`; the
+                  final data event carries finish_reason/usage, followed by
+                  `data: [DONE]`.
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -83,6 +90,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE stream. Each event is `data: <CompletionChunk>`; the
+                  final data event carries finish_reason/usage, followed by
+                  `data: [DONE]`.
         '400':
           $ref: '#/components/responses/BadRequest'
 
@@ -151,6 +165,15 @@ components:
         seed:
           type: integer
           default: 20261007
+        stream:
+          type: boolean
+          default: false
+          description: |
+            If true, stream the completion as Server-Sent Events:
+            `Content-Type: text/event-stream`, `Transfer-Encoding: chunked`.
+            Each event is `data: <CompletionChunk>`; the final data event
+            carries `finish_reason` and `usage`, followed by `data: [DONE]`.
+            The response is then terminated with the chunked trailer.
 
     CompletionResponse:
       type: object
@@ -191,6 +214,50 @@ components:
             prompt_tokens:
               type: integer
               const: 1
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+
+    CompletionChunk:
+      type: object
+      description: |
+        One SSE `data:` payload. Delta chunks carry
+        `choices[0].delta.content`; the final chunk carries
+        `choices[0].finish_reason` and `usage`.
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: text_completion
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            required: [index]
+            properties:
+              index:
+                type: integer
+                const: 0
+              delta:
+                type: object
+                properties:
+                  content:
+                    type: string
+              finish_reason:
+                type: [string, 'null']
+                enum: [stop, length, null]
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
             completion_tokens:
               type: integer
             total_tokens:

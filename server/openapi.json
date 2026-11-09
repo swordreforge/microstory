@@ -80,6 +80,12 @@
                 "schema": {
                   "$ref": "#/components/schemas/CompletionResponse"
                 }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "SSE stream. Each event is `data: <CompletionChunk>`; the\nfinal data event carries finish_reason/usage, followed by\n`data: [DONE]`.\n"
+                }
               }
             }
           },
@@ -116,6 +122,12 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/CompletionResponse"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "SSE stream. Each event is `data: <CompletionChunk>`; the\nfinal data event carries finish_reason/usage, followed by\n`data: [DONE]`.\n"
                 }
               }
             }
@@ -216,6 +228,11 @@
           "seed": {
             "type": "integer",
             "default": 20261007
+          },
+          "stream": {
+            "type": "boolean",
+            "default": false,
+            "description": "If true, stream the completion as Server-Sent Events:\n`Content-Type: text/event-stream`, `Transfer-Encoding: chunked`.\nEach event is `data: <CompletionChunk>`; the final data event\ncarries `finish_reason` and `usage`, followed by `data: [DONE]`.\nThe response is then terminated with the chunked trailer.\n"
           }
         }
       },
@@ -294,6 +311,80 @@
               "prompt_tokens": {
                 "type": "integer",
                 "const": 1
+              },
+              "completion_tokens": {
+                "type": "integer"
+              },
+              "total_tokens": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "CompletionChunk": {
+        "type": "object",
+        "description": "One SSE `data:` payload. Delta chunks carry\n`choices[0].delta.content`; the final chunk carries\n`choices[0].finish_reason` and `usage`.\n",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string",
+            "const": "text_completion"
+          },
+          "created": {
+            "type": "integer"
+          },
+          "model": {
+            "type": "string"
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "index"
+              ],
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "const": 0
+                },
+                "delta": {
+                  "type": "object",
+                  "properties": {
+                    "content": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "finish_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "stop",
+                    "length",
+                    null
+                  ]
+                }
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "prompt_tokens": {
+                "type": "integer"
               },
               "completion_tokens": {
                 "type": "integer"
