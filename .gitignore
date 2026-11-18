@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# 导出 / 构建产物（按需生成，见 REPORT.md）
+converted/
+build/
+*.onnx
+*.ncnn.param
+*.ncnn.bin
+
+# C++ / Zig 构建输出
+*.o
+*.obj
+*.so
+*.a
+zig-cache/
+zig-out/
+.zig-cache/
+
+# 压缩包 / 本地备份
+MacroStories.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# 编辑器与本地工具
+.commandcode/
+.vscode/
+.idea/
+.DS_Store
+
+# 本地环境
+.env
