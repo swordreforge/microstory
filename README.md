@@ -22,6 +22,18 @@ MacroStories is a **19,969-parameter autoregressive Transformer** that generates
 
 We takes this question down to about **20 thousand parameters**, roughly one fiftieth of a one-million-parameter model and proved that a model even this small can write a story of 100–300 words that establishes a goal, takes relevant actions, and reaches an outcome that resolves it.
 
+## What's new since the original release
+
+This repository keeps the model unchanged and adds an inference-engineering track on top of it:
+
+- **Hand-written C++17 backend** (`cpp/`) — zero third-party dependencies, reads `model.safetensors` and `tokenizer.json` directly; AVX2 + FMA kernels, a 4-slot KV cache (one per recurrent pass), batched GEMM, optimized top-p selection and a vectorized `exp`. About **110k tok/s** on one thread, **~285k tok/s** with 22 threads, **~7.6 MB** peak RSS; logits match the Python reference to `5.6e-6`, and `--selftest-kv/simd/batch` make that check reproducible.
+- **ONNX and ncnn export** (`export_onnx.py`) — fp32 graphs with dynamic batch/sequence, max abs diff `1.2e-5` against the PyTorch reference; artifacts are generated on demand into `converted/`.
+- **Zig 0.17 single-file port** (`zig/stories.zig`) — same checkpoint and tokenizer, arena-based explicit allocation, logits diff `6.5e-6`, ~15k tok/s single-threaded, as an experiment in allocation and language overhead.
+- **io_uring HTTP API** (`server/`) — pure-Linux server with an OpenAPI 3.1 contract, an OpenAI-compatible subset (`/v1/models`, `/v1/completions`, `/v1/stories`) and SSE streaming; deployed behind h2o at `en.tiny-story.swordreforge.top`.
+- **Profiling and measurement** — per-backend throughput under an identical prompt and seed (PyTorch XPU ~22 tok/s, PyTorch CPU ~113 tok/s, ONNX Runtime ~342 tok/s, hand-written C++ ~110k tok/s), peak RSS and CPU-time breakdowns, plus the negative results that shaped the defaults (Vulkan ~18x slower than CPU, AVX-512 ~17% slower than AVX2 on a Xeon, int8 unusable at this size).
+
+Conclusions and backend selection guidance are in [REPORT.md §7 (Chinese)](./REPORT.md#7-结论与建议), with the measurement methodology and lessons in [RETROSPECTIVE.md](./RETROSPECTIVE.md).
+
 ## Quick start
 
 ```bash
