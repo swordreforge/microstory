@@ -355,7 +355,7 @@ make -C cpp
 
 ## 10. 外部代码评审的处理
 
-对一次外部（LLM）代码评审逐条对照当前实现后的处理：
+对一次外部（LLM）代码评审逐条对照当前实现后的处理（评审原文见 [`docs/external-review.md`](docs/external-review.md)）：
 
 | 评审项 | 结论 | 处理 |
 |---|---|---|
